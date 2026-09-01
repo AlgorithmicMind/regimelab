@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Runtime artifacts
+.artifacts/
+.test-artifacts/
+*.html
+scratch_*.py
+regimelab_test.toml

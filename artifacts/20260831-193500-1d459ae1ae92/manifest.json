@@ -1,0 +1,116 @@
+{
+  "asof": null,
+  "command": "run",
+  "created_at": "2026-08-31T19:35:00.357393Z",
+  "git": {
+    "branch": null,
+    "commit": null,
+    "dirty": true
+  },
+  "input_digest": "a26fbcf3a3d414aa82e2bb4f549ffa5c7ed2051ba1496322aea730d6171a9ff1",
+  "packages": {
+    "hmmlearn": "0.3.3",
+    "numpy": "2.5.2",
+    "pandas": "3.0.5",
+    "pyarrow": "25.0.1",
+    "regimelab": "0.1.0",
+    "scikit-learn": "1.9.0",
+    "scipy": "1.18.1",
+    "statsmodels": "0.15.0"
+  },
+  "platform": "Windows-10-10.0.19045-SP0",
+  "python_version": "3.12.4",
+  "run_id": "1d459ae1ae92",
+  "seed": 20260831,
+  "settings": {
+    "artifacts_dir": "artifacts",
+    "backtest": {
+      "confidence_floor": 0.0,
+      "initial_capital": 1000000.0,
+      "refit_frequency_days": 63,
+      "regime_weights": {
+        "BULL_TREND": {
+          "GLD": 0.0,
+          "SPY": 0.9,
+          "TLT": 0.1
+        },
+        "HIGH_VOL_BEAR": {
+          "GLD": 0.15,
+          "SPY": 0.2,
+          "TLT": 0.4
+        },
+        "NEUTRAL_TRANSITION": {
+          "GLD": 0.1,
+          "SPY": 0.5,
+          "TLT": 0.25
+        },
+        "RISK_OFF": {
+          "GLD": 0.2,
+          "SPY": 0.0,
+          "TLT": 0.3
+        }
+      },
+      "risk_free_rate": 0.02,
+      "signal_lag_days": 1,
+      "transaction_cost_bps": 5.0
+    },
+    "data": {
+      "benchmark": "SPY",
+      "cache_dir": "C:\\Users\\Jos\u00e9 Luis Castej\u00f3n\\AppData\\Local\\regimelab\\regimelab\\Cache",
+      "cache_ttl_hours": 12.0,
+      "calendar_anchor": "SPY",
+      "cross_section": [
+        "XLB",
+        "XLE",
+        "XLF",
+        "XLI",
+        "XLK",
+        "XLP",
+        "XLU",
+        "XLV",
+        "XLY"
+      ],
+      "end": null,
+      "provider": "synthetic",
+      "risk_assets": [
+        "SPY",
+        "TLT",
+        "GLD"
+      ],
+      "start": "2005-01-01",
+      "vix3m_symbol": "^VIX3M",
+      "vix_symbol": "^VIX"
+    },
+    "features": {
+      "absorption_delta_long": 252,
+      "absorption_delta_short": 15,
+      "absorption_eigen_fraction": 0.2,
+      "absorption_window": 500,
+      "breadth_momentum_window": 21,
+      "breadth_sma": 200,
+      "correlation_window": 63,
+      "trading_days_per_year": 252,
+      "trailing_return_window": 21,
+      "volatility_window": 21
+    },
+    "model": {
+      "classifier": "hmm",
+      "covariance_type": "diag",
+      "features": [
+        "trailing_return",
+        "realised_vol",
+        "vix_term_spread",
+        "absorption_delta",
+        "mean_correlation"
+      ],
+      "max_iter": 500,
+      "min_state_occupancy": 0.03,
+      "min_train_observations": 756,
+      "n_init": 2,
+      "n_states": 4,
+      "seed": 20260831,
+      "tolerance": 0.0001,
+      "verbose": false
+    }
+  }
+}

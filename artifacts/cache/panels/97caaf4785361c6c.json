@@ -1,0 +1,24 @@
+{
+  "provider": "synthetic-20260831",
+  "is_point_in_time": true,
+  "symbols": [
+    "GLD",
+    "SPY",
+    "TLT",
+    "XLB",
+    "XLE",
+    "XLF",
+    "XLI",
+    "XLK",
+    "XLP",
+    "XLU",
+    "XLV",
+    "XLY",
+    "^VIX",
+    "^VIX3M"
+  ],
+  "start": "2005-01-01",
+  "end": null,
+  "fetched_at": "2026-08-31T20:16:30.977253+00:00",
+  "rows": 5651
+}
