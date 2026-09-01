@@ -124,12 +124,25 @@ Additional CLI commands include `regimelab report OUTPUT` for direct HTML genera
 
 ## 🧠 Core Methodology & Architecture
 
-```mermaid
-flowchart TD
-    A["📦 Data Layer (PIT Alignment & Caching)"] --> B["⚡ Causal Features (PCA Absorption, VIX Spread, Breadth)"]
-    B --> C["🧠 Models (Hamilton / HMM / GMM + Anti-Switch Ordering)"]
-    C --> D["📈 Walk-Forward Engine (Dynamic Allocations)"]
-    C --> E["📊 Telemetry, HTML Report & Textual TUI"]
+```text
+                       ┌──────────────────────────────────────────────┐
+                       │     Data Layer (PIT Alignment & Caching)     │
+                       └──────────────────────┬───────────────────────┘
+                                              │
+                       ┌──────────────────────▼───────────────────────┐
+                       │   Causal Features (PCA Absorption, Spread)   │
+                       └──────────────────────┬───────────────────────┘
+                                              │
+                       ┌──────────────────────▼───────────────────────┐
+                       │ Models: Hamilton / HMM / GMM + Anti-Switch   │
+                       └──────────────────────┬───────────────────────┘
+                                              │
+               ┌──────────────────────────────┴──────────────────────────────┐
+               ▼                                                             ▼
+  ┌─────────────────────────┐                                   ┌─────────────────────────┐
+  │   Walk-Forward Engine   │                                   │  Telemetry, HTML & TUI  │
+  │  (Dynamic Allocations)  │                                   │ (Interactive Artifacts) │
+  └─────────────────────────┘                                   └─────────────────────────┘
 ```
 
 ### 1. Canonical State Labeling (`regimelab.models.labeling`)

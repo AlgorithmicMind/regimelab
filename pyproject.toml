@@ -1,6 +1,6 @@
 [project]
 name = "regimelab"
-version = "0.1.1"
+version = "0.1.2"
 description = "Institutional market-regime detection engine: HMM/Hamilton regime switching, PCA absorption ratio, VIX term structure, point-in-time backtesting and automated reporting."
 readme = "README.md"
 license = "MIT"
