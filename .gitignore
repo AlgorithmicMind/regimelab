@@ -10,7 +10,9 @@ wheels/
 .venv
 
 # Runtime artifacts
+artifacts/
 .artifacts/
+*.parquet
 .test-artifacts/
 *.html
 scratch_*.py

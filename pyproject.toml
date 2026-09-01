@@ -1,12 +1,12 @@
 [project]
 name = "regimelab"
-version = "0.1.2"
+version = "0.1.3"
 description = "Institutional market-regime detection engine: HMM/Hamilton regime switching, PCA absorption ratio, VIX term structure, point-in-time backtesting and automated reporting."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
-    { name = "AlgorithmicMind", email = "tonidinero27@gmail.com" }
+    { name = "Pedro Castejon"}
 ]
 keywords = [
     "quantitative-finance",

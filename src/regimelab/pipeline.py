@@ -19,6 +19,7 @@ must fit inside a :class:`~regimelab.models.types.TelemetryPayload`.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -104,6 +105,8 @@ def run_pipeline(
     *,
     command: str = "run",
     run_backtest: bool = True,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    status_callback: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     """Run the full point-in-time pipeline.
 
@@ -115,13 +118,23 @@ def run_pipeline(
         CLI command name to record in the manifest.
     run_backtest
         Whether to run the walk-forward backtest.
+    progress_callback
+        Optional callback forwarded to :func:`~regimelab.backtest.walkforward.run_walk_forward`
+        with ``(current_fold, total_folds, test_date)``.
+    status_callback
+        Optional callback invoked with human-readable phase descriptions.
 
     Returns
     -------
     PipelineResult
         Full result with a writable :class:`~regimelab.store.RunStore`.
     """
+    if status_callback is not None:
+        status_callback("Fetching & aligning PIT market data...")
     panel = _fetch_and_align(settings)
+
+    if status_callback is not None:
+        status_callback("Computing systemic risk feature matrix...")
     features = build_feature_matrix(panel, settings)
 
     manifest = RunManifest.capture(
@@ -131,11 +144,14 @@ def run_pipeline(
     )
     store = RunStore(settings.artifacts_dir, manifest)
 
+    if status_callback is not None:
+        status_callback("Running walk-forward regime estimation...")
     walkforward = run_walk_forward(
         panel,
         features,
         settings,
         run_backtest=run_backtest,
+        progress_callback=progress_callback,
     )
 
     store.write_manifest()

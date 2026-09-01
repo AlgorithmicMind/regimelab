@@ -22,6 +22,7 @@ to remember what tail risk looks like.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -148,6 +149,7 @@ def run_walk_forward(
     settings: Settings,
     *,
     run_backtest: bool = True,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> WalkForwardResult:
     """Run the walk-forward regime classification loop.
 
@@ -161,6 +163,10 @@ def run_walk_forward(
         Resolved configuration.
     run_backtest
         Whether to run the regime-conditional backtest on the resulting path.
+    progress_callback
+        Optional callback invoked at the start of each test fold with
+        ``(current_fold, total_folds, test_date)`` where ``test_date`` is an
+        ISO-formatted string for the fold's test period end.
 
     Returns
     -------
@@ -189,14 +195,18 @@ def run_walk_forward(
     # subsequent folds use the posterior at the previous refit date.
     initial: np.ndarray | None = None
 
+    total_folds = len(refit_dates)
     for fold_index, train_end in enumerate(refit_dates):
-        is_last = fold_index == len(refit_dates) - 1
+        is_last = fold_index == total_folds - 1
 
         # Out-of-sample segment is (prev_train_end, current_train_end], except
         # for the final fold, which is (prev_train_end, last_feature_date].
         test_start = full.index[0] if fold_index == 0 else refit_dates[fold_index - 1]
 
         test_end = full.index[-1] if is_last else refit_dates[fold_index + 1]
+
+        if progress_callback is not None:
+            progress_callback(fold_index + 1, total_folds, test_end.date().isoformat())
 
         # Training always starts from the earliest complete feature row.
         train_start = full.index[0]

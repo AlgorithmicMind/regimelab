@@ -12,6 +12,16 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 
 from regimelab.models.types import TelemetryPayload
 from regimelab.pipeline import run_pipeline, run_single_asof
@@ -81,23 +91,77 @@ def run(
 ) -> None:
     """Run the full walk-forward pipeline and backtest."""
     settings = _load_settings(config)
-    result = run_pipeline(settings, command="run")
+    console = Console()
+    total_phases = 4 if report is not None else 3
 
-    typer.echo(f"run: {result.manifest.provenance_line()}")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        overall = progress.add_task("Initializing pipeline...", total=total_phases)
+        fold_task = progress.add_task("", total=None, visible=False)
+
+        def _status(message: str) -> None:
+            progress.update(overall, description=message, advance=1)
+
+        def _progress_callback(current_fold: int, total_folds: int, test_date: str) -> None:
+            if current_fold == 1:
+                progress.update(
+                    fold_task,
+                    visible=True,
+                    total=total_folds,
+                    completed=0,
+                )
+            progress.update(
+                fold_task,
+                completed=current_fold,
+                description=(
+                    f"Running walk-forward regime estimation "
+                    f"(fold {current_fold} of {total_folds}) — {test_date}"
+                ),
+            )
+
+        result = run_pipeline(
+            settings,
+            command="run",
+            progress_callback=_progress_callback,
+            status_callback=_status,
+        )
+
+        if report is not None:
+            _status(f"Writing interactive HTML report to {report}...")
+            path = write_html_report(result, report)
+            progress.update(overall, completed=total_phases)
+
+        if tui:
+            try:
+                RegimeLabApp(result).run()
+            except ModuleNotFoundError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+
     if result.backtest is not None:
-        typer.echo(f"strategy cagr: {result.backtest.metrics.cagr:.2%}")
-        typer.echo(f"benchmark cagr: {result.backtest.benchmark_metrics.cagr:.2%}")
-        typer.echo(f"max drawdown: {result.backtest.metrics.max_drawdown:.2%}")
+        summary_lines = [
+            f"Strategy CAGR: {result.backtest.metrics.cagr:.2%}",
+            f"Benchmark CAGR: {result.backtest.benchmark_metrics.cagr:.2%}",
+            f"Sharpe Ratio: {result.backtest.metrics.sharpe:.2f}",
+        ]
+    else:
+        summary_lines = ["Backtest result not available."]
 
     if report is not None:
-        path = write_html_report(result, report)
-        typer.echo(f"report written: {path}")
+        summary_lines.append(f"Report written: {path}")
 
-    if tui:
-        try:
-            RegimeLabApp(result).run()
-        except ModuleNotFoundError as exc:
-            raise typer.BadParameter(str(exc)) from exc
+    console.print(
+        Panel.fit(
+            "\n".join(summary_lines),
+            title="RegimeLab Results",
+            border_style="blue",
+        ),
+    )
 
 
 @app.command()
