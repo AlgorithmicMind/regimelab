@@ -226,18 +226,26 @@ def run_single_asof(
     asof: dt.date,
     *,
     command: str = "asof",
+    fitted: FittedRegime | None = None,
 ) -> TelemetryPayload:
     """Produce a telemetry payload for a specific historical as-of date.
 
     The model is fit through ``asof`` and the filter is run up to ``asof``,
     then the payload is built. This is the function used by the ``asof`` CLI
     command and by the research notebook examples.
+
+    If ``fitted`` is provided, the model is *not* retrained.  Instead the
+    supplied :class:`~regimelab.models.base.FittedRegime` is filtered causally
+    through ``asof`` using its frozen parameters and standardiser.
     """
     panel = _fetch_and_align(settings)
     features = build_feature_matrix(panel, settings)
     returns = panel.log_returns([settings.data.benchmark])[settings.data.benchmark]
 
-    fit = _fit_single_model(features, returns, settings, train_end=pd.Timestamp(asof))
+    if fitted is None:
+        fit = _fit_single_model(features, returns, settings, train_end=pd.Timestamp(asof))
+    else:
+        fit = fitted
     probabilities = fit.probabilities_at(features, asof)
     regime = probabilities.argmax
     snapshot = snapshot_at(features, asof)

@@ -19,9 +19,11 @@ would let each day's parameters absorb information from that same day.
 from __future__ import annotations
 
 import datetime as dt
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Self, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 import numpy as np
 import pandas as pd
@@ -30,6 +32,7 @@ from regimelab.models.filters import forward_filter, gaussian_log_density
 from regimelab.models.labeling import (
     LabelAssignment,
     RankingMethod,
+    StateStatistics,
     assign_labels,
     relabel_probabilities,
     summarise_states,
@@ -376,6 +379,145 @@ class FittedRegime:
         persistence = pd.Series(np.diag(matrix.to_numpy()), index=matrix.index)
         durations = 1.0 / (1.0 - persistence).where(persistence < 1.0)
         return durations.rename("expected_duration")
+
+    def to_bundle(self) -> dict[str, Any]:
+        """Serialize the fitted model into a plain dict of arrays and metadata.
+
+        The bundle keeps arrays as :class:`numpy.ndarray` objects so that callers
+        can choose how to persist them (``np.savez_compressed``) while the
+        metadata is JSON-serialisable.
+        """
+        arrays: dict[str, np.ndarray] = {
+            "emission_means": self.estimate.emission.means,
+            "emission_covariances": self.estimate.emission.covariances,
+            "standardiser_centre": self.standardiser.centre,
+            "standardiser_scale": self.standardiser.scale,
+            "posteriors": self.estimate.posteriors,
+        }
+        if self.estimate.transition is not None:
+            arrays["transition"] = self.estimate.transition
+
+        metadata = {
+            "classifier": self.classifier,
+            "estimate": {
+                "log_likelihood": self.estimate.log_likelihood,
+                "converged": self.estimate.converged,
+            },
+            "standardiser": {
+                "columns": list(self.standardiser.columns),
+            },
+            "assignment": {
+                "mapping": {
+                    str(state): regime.value
+                    for state, regime in self.assignment.mapping.items()
+                },
+                "method": self.assignment.method.value,
+                "statistics": [
+                    {
+                        "state": stat.state,
+                        "occupancy": stat.occupancy,
+                        "mean_return": stat.mean_return,
+                        "volatility": stat.volatility,
+                        "n_observations": stat.n_observations,
+                    }
+                    for stat in self.assignment.statistics
+                ],
+            },
+            "metadata": self.metadata.model_dump(mode="json"),
+        }
+
+        return {"arrays": arrays, "metadata": metadata}
+
+    @classmethod
+    def from_bundle(cls, bundle: dict[str, Any]) -> Self:
+        """Reconstruct a :class:`FittedRegime` from a bundle produced by :meth:`to_bundle`."""
+        arrays = bundle["arrays"]
+        meta = bundle["metadata"]
+
+        emission = EmissionParameters(
+            means=arrays["emission_means"],
+            covariances=arrays["emission_covariances"],
+        )
+        transition = arrays.get("transition")
+        posteriors = arrays.get("posteriors")
+        if posteriors is None:
+            # Reconstruct a placeholder if the bundle omitted training posteriors.
+            n_states = emission.means.shape[0]
+            posteriors = np.empty((0, n_states), dtype="float64")
+
+        estimate = StateEstimate(
+            posteriors=posteriors,
+            emission=emission,
+            transition=transition,
+            log_likelihood=meta["estimate"]["log_likelihood"],
+            converged=meta["estimate"]["converged"],
+        )
+
+        standardiser = CausalStandardiser(
+            columns=tuple(meta["standardiser"]["columns"]),
+            centre=arrays["standardiser_centre"],
+            scale=arrays["standardiser_scale"],
+        )
+
+        statistics = tuple(
+            StateStatistics(
+                state=stat["state"],
+                occupancy=stat["occupancy"],
+                mean_return=stat["mean_return"],
+                volatility=stat["volatility"],
+                n_observations=stat["n_observations"],
+            )
+            for stat in meta["assignment"]["statistics"]
+        )
+
+        assignment = LabelAssignment(
+            mapping={
+                int(state): MarketRegime(regime)
+                for state, regime in meta["assignment"]["mapping"].items()
+            },
+            statistics=statistics,
+            method=RankingMethod(meta["assignment"]["method"]),
+        )
+
+        metadata = ModelMetadata.model_validate(meta["metadata"])
+
+        return cls(
+            classifier=meta["classifier"],
+            estimate=estimate,
+            assignment=assignment,
+            standardiser=standardiser,
+            metadata=metadata,
+        )
+
+    def save(self, path: Path | str) -> None:
+        """Persist the fitted model to ``path`` as a directory.
+
+        ``path`` may be a :class:`str` or a :class:`pathlib.Path`.  The bundle
+        is written as a directory containing ``arrays.npz`` (all NumPy arrays,
+        compressed) and ``metadata.json`` (JSON-serialisable provenance).  No
+        particular file extension is required or enforced; callers may use
+        ``.bundle``, ``.npz`` or any other convention.
+        """
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        bundle = self.to_bundle()
+        np.savez_compressed(path / "arrays.npz", **bundle["arrays"])
+        (path / "metadata.json").write_text(
+            json.dumps(bundle["metadata"], indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def load(cls, path: Path | str) -> Self:
+        """Load a fitted model from a directory previously written by :meth:`save`.
+
+        ``path`` may be a :class:`str` or a :class:`pathlib.Path` and must point
+        to a bundle directory containing ``arrays.npz`` and ``metadata.json``.
+        """
+        path = Path(path)
+        arrays = np.load(path / "arrays.npz")
+        metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+        return cls.from_bundle({"arrays": dict(arrays), "metadata": metadata})
 
 
 class RegimeModel(ABC):
