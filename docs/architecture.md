@@ -14,7 +14,7 @@ Configuration lives in `regimelab.settings` and uses `pydantic-settings`. Preced
 4. `regimelab.toml` in the working directory.
 5. The documented defaults below.
 
-All sections are immutable (`frozen=True`) and reject extra fields (`extra="forbid"`).
+All sections are immutable (`frozen=True`) and ignore unmapped foreign environment variables (`extra="ignore"`) to ensure seamless integration when imported inside host applications with their own environment configurations (e.g. LLM or database API keys).
 
 ### 1.1 `DataSettings`
 
@@ -555,7 +555,7 @@ Example fields (Pydantic serialized to JSON):
   "python_version": "3.12.4",
   "platform": "Windows-11...",
   "packages": {
-    "regimelab": "0.1.2",
+    "regimelab": "0.1.4",
     "numpy": "2.5.2",
     "pandas": "3.0.5",
     ...
