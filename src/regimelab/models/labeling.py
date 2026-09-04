@@ -311,7 +311,30 @@ def assign_labels(
         return (-safe_score, safe_vol, stat.state)
 
     ordered = tuple(sorted(statistics, key=sort_key))
-    mapping = {stat.state: ladder[rank] for rank, stat in enumerate(ordered)}
+
+    # Economic guardrail: positive-drift states can never be mapped onto bearish
+    # canonical regimes.  If the strict Sharpe ladder would place a positive-mean
+    # state in HIGH_VOL_BEAR or RISK_OFF, cap it at the most risk-off non-bear
+    # label available in the ladder (NEUTRAL_TRANSITION for 3- and 4-state models,
+    # BULL_TREND for 2-state models).  When several positive states compete for
+    # the same non-bear label, the later duplicates are resolved by
+    # :func:`relabel_probabilities`, which aggregates raw-state probabilities per
+    # canonical regime.
+    non_bear_labels = [
+        label for label in ladder if label not in (MarketRegime.HIGH_VOL_BEAR, MarketRegime.RISK_OFF)
+    ]
+    cap_label = non_bear_labels[-1] if non_bear_labels else ladder[0]
+
+    mapping: dict[int, MarketRegime] = {}
+    for rank, stat in enumerate(ordered):
+        label = ladder[rank]
+        if (
+            label in (MarketRegime.HIGH_VOL_BEAR, MarketRegime.RISK_OFF)
+            and np.isfinite(stat.mean_return)
+            and stat.mean_return >= 0.0
+        ):
+            label = cap_label
+        mapping[stat.state] = label
 
     return LabelAssignment(mapping=mapping, statistics=ordered, method=method)
 
@@ -350,5 +373,13 @@ def relabel_probabilities(
         columns={c: assignment.mapping[int(c)].value for c in posteriors.columns},
     )
 
+    # The economic guardrail in :func:`assign_labels` may map several raw states
+    # onto the same canonical regime (e.g. multiple positive-drift states capped
+    # at NEUTRAL_TRANSITION).  Sum their probabilities so each canonical regime
+    # appears exactly once.
+    if len(set(renamed.columns)) < len(renamed.columns):
+        renamed = renamed.T.groupby(level=0).sum().T
+
     ladder = regime_ladder(len(assignment.mapping))
-    return renamed.loc[:, [regime.value for regime in ladder]]
+    regime_names = [regime.value for regime in ladder]
+    return renamed.reindex(columns=regime_names, fill_value=0.0)
