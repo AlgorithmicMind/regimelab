@@ -17,3 +17,4 @@ artifacts/
 *.html
 scratch_*.py
 regimelab_test.toml
+.coverage
