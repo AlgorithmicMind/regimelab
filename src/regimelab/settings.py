@@ -287,7 +287,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         toml_file="regimelab.toml",
-        extra="forbid",
+        extra="ignore",
         frozen=True,
         validate_assignment=True,
     )
