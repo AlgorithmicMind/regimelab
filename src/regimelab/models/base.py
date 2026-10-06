@@ -55,6 +55,7 @@ __all__ = [
     "InsufficientDataError",
     "RegimeModel",
     "StateEstimate",
+    "probabilities_from_row",
 ]
 
 # Floor for a feature's training standard deviation. Below this the feature is
@@ -65,6 +66,17 @@ _MIN_SCALE = 1e-12
 
 class InsufficientDataError(ValueError):
     """Raised when the training window is too small to fit the requested model."""
+
+
+def probabilities_from_row(row: pd.Series) -> RegimeProbabilities:
+    """Build the validated schema from a posterior row.
+
+    The row's values are column labels holding regime values (e.g.
+    ``"BULL_TREND"``), one probability per regime.
+    """
+    return RegimeProbabilities(
+        probabilities={MarketRegime(str(name)): float(value) for name, value in row.items()},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,21 +348,30 @@ class FittedRegime:
             name="regime",
         )
 
+    def posterior_at(
+        self,
+        features: pd.DataFrame,
+        asof: dt.date | pd.Timestamp,
+    ) -> tuple[RegimeProbabilities, pd.Timestamp]:
+        """Validated posterior at the most recent date at or before ``asof``.
+
+        Also returns the date of the observation that produced it, which is
+        earlier than ``asof`` whenever the newest rows are not filterable.
+        """
+        posteriors = self.probabilities(features.loc[: pd.Timestamp(asof)])
+        if posteriors.empty:
+            msg = f"no filterable observation at or before {asof}"
+            raise InsufficientDataError(msg)
+
+        return probabilities_from_row(posteriors.iloc[-1]), posteriors.index[-1]
+
     def probabilities_at(
         self,
         features: pd.DataFrame,
         asof: dt.date | pd.Timestamp,
     ) -> RegimeProbabilities:
         """Validated posterior at the most recent date at or before ``asof``."""
-        posteriors = self.probabilities(features.loc[: pd.Timestamp(asof)])
-        if posteriors.empty:
-            msg = f"no filterable observation at or before {asof}"
-            raise InsufficientDataError(msg)
-
-        row = posteriors.iloc[-1]
-        return RegimeProbabilities(
-            probabilities={MarketRegime(str(name)): float(value) for name, value in row.items()},
-        )
+        return self.posterior_at(features, asof)[0]
 
     def transition_matrix(self) -> pd.DataFrame:
         """Transition matrix with regime names, ordered by the risk ladder.
@@ -408,8 +429,7 @@ class FittedRegime:
             },
             "assignment": {
                 "mapping": {
-                    str(state): regime.value
-                    for state, regime in self.assignment.mapping.items()
+                    str(state): regime.value for state, regime in self.assignment.mapping.items()
                 },
                 "method": self.assignment.method.value,
                 "statistics": [
@@ -419,6 +439,7 @@ class FittedRegime:
                         "mean_return": stat.mean_return,
                         "volatility": stat.volatility,
                         "n_observations": stat.n_observations,
+                        "stress_score": stat.stress_score,
                     }
                     for stat in self.assignment.statistics
                 ],
@@ -466,6 +487,7 @@ class FittedRegime:
                 mean_return=stat["mean_return"],
                 volatility=stat["volatility"],
                 n_observations=stat["n_observations"],
+                stress_score=stat.get("stress_score"),
             )
             for stat in meta["assignment"]["statistics"]
         )
@@ -627,10 +649,14 @@ class RegimeModel(ABC):
             columns=list(range(estimate.n_states)),
         )
         statistics = summarise_states(reference_returns, posteriors)
+        method = self._settings.ranking_method or self.ranking_method
         assignment = assign_labels(
             statistics,
-            method=self.ranking_method,
+            method=method,
             min_occupancy=self._settings.min_state_occupancy,
+            emission_means=estimate.emission.means,
+            feature_names=standardiser.columns,
+            signs=self._settings.effective_stress_signs,
         )
 
         metadata = ModelMetadata(

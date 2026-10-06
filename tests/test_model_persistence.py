@@ -6,7 +6,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from regimelab.models.base import FittedRegime
 from regimelab.models.registry import build_classifier
@@ -52,8 +51,10 @@ def test_run_single_asof_uses_fitted_model_without_refit(pipeline_result: Pipeli
     fit = _fit_model(pipeline_result)
     asof = fit.metadata.train_end
 
-    # Reproduce the same payload with and without the pre-trained model.
-    cold = run_single_asof(settings, asof)
+    # Reproduce the same payload with and without the pre-trained model. The
+    # daily policy fits through ``asof``, which is what ``_fit_model`` did, so
+    # the comparison stays model-for-model.
+    cold = run_single_asof(settings, asof, refit_policy="daily")
     with_fitted = run_single_asof(settings, asof, fitted=fit)
 
     assert cold.regime == with_fitted.regime

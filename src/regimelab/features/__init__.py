@@ -150,15 +150,17 @@ def build_feature_matrix(panel: AlignedPanel, settings: Settings) -> pd.DataFram
         )
 
     # --- Cross-asset coupling ----------------------------------------------
-    allocation_universe = [s for s in data_cfg.risk_assets if s in available]
-    if len(allocation_universe) >= 2:
+    # The correlation universe is a signal-universe setting: what the portfolio
+    # may hold (data.risk_assets) must not change the model's inputs.
+    correlation_universe = [s for s in data_cfg.correlation_assets if s in available]
+    if len(correlation_universe) >= 2:
         blocks.append(
             correlation_features(
-                panel.log_returns(allocation_universe),
+                panel.log_returns(correlation_universe),
                 window=feature_cfg.correlation_window,
                 risk_asset=risk_asset,
-                defensive_assets=[s for s in allocation_universe if s != risk_asset],
-                min_assets=min(3, len(allocation_universe)),
+                defensive_assets=[s for s in correlation_universe if s != risk_asset],
+                min_assets=min(3, len(correlation_universe)),
             ),
         )
 

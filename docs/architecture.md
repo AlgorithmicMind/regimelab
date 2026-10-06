@@ -21,11 +21,13 @@ All sections are immutable (`frozen=True`) and ignore unmapped foreign environme
 | Field | Type | Default | Description / Validation |
 |-------|------|---------|------------------------|
 | `provider` | `Literal["parquet", "synthetic", "yfinance"]` | `"yfinance"` | Data provider. |
-| `risk_assets` | `tuple[str, ...]` | `("SPY", "TLT", "GLD")` | Symbols eligible for allocation in the backtest. |
+| `risk_assets` | `tuple[str, ...]` | `("SPY", "TLT", "GLD")` | Investable universe — used only by the backtest and allocation; never read by the feature layer. |
 | `benchmark` | `str` | `"SPY"` | Buy-and-hold benchmark. |
 | `vix_symbol` | `str` | `"^VIX"` | 30-day implied volatility index. |
 | `vix3m_symbol` | `str` | `"^VIX3M"` | 93-day implied volatility index. |
+| `volatility_source` | `Literal["official", "provider"]` | `"official"` | Volatility input routing. `"official"` reads CBOE first, falls back to FRED, then to the configured provider; applies only when `provider="yfinance"`. |
 | `cross_section` | `tuple[str, ...]` | 9 sector SPDRs (`XLB`…`XLY`) | Cross-section for absorption and breadth. |
+| `correlation_assets` | `tuple[str, ...]` | `("SPY", "TLT", "GLD")` | Signal universe for the cross-asset correlation features; independent of `risk_assets`. |
 | `start` | `dt.date` | `2005-01-01` | Start date for data ingestion. |
 | `end` | `dt.date \| None` | `None` | End date (`None` means latest available). |
 | `cache_dir` | `Path` | `platformdirs.user_cache_dir("regimelab")` | Local cache directory. |
@@ -34,11 +36,12 @@ All sections are immutable (`frozen=True`) and ignore unmapped foreign environme
 
 **Public properties**
 
-- `all_symbols: tuple[str, ...]` — ordered union of `risk_assets`, `cross_section`, `benchmark`, `vix_symbol`, `vix3m_symbol`, `calendar_anchor`.
+- `all_symbols: tuple[str, ...]` — ordered union of `risk_assets`, `cross_section`, `correlation_assets`, `benchmark`, `vix_symbol`, `vix3m_symbol`, `calendar_anchor`.
 
 **Validations**
 
 - `len(cross_section) >= 3` (the PCA covariance matrix needs at least 3 assets).
+- `len(correlation_assets) >= 2` (a correlation needs at least two series).
 - If `end` is not `None`, it must be later than `start`.
 
 ### 1.2 `FeatureSettings`
@@ -65,6 +68,8 @@ All sections are immutable (`frozen=True`) and ignore unmapped foreign environme
 | Field | Type | Default | Description / Validation |
 |-------|------|---------|--------------------------|
 | `classifier` | `Literal["hmm", "gmm", "hamilton"]` | `"hmm"` | Regime classifier. |
+| `ranking_method` | `RankingMethod \| None` | `None` | State ranking override; `None` uses the classifier default (`stress` for hmm/hamilton, `volatility` for gmm — see `DEFAULT_RANKING_METHODS`). |
+| `stress_signs` | `dict[str, Literal[-1, 1]] \| None` | `None` | Stress sign per feature for STRESS ranking. `None` uses `STRESS_SIGNS`; a dict replaces it entirely — never merged. The defaults are a reasoned convention: volatility and absorption rising means stress; VIX term spread, trailing return and breadth rising means calm. `mean_correlation` is excluded because the sign of stock/bond correlation under stress changes across eras. |
 | `n_states` | `int` | `4` | Number of latent states. `[2, 4]`. |
 | `seed` | `int` | `20260831` | Master seed for reproducibility. |
 | `n_init` | `int` | `10` | EM restarts. `>= 1`. |
@@ -75,6 +80,11 @@ All sections are immutable (`frozen=True`) and ignore unmapped foreign environme
 | `min_train_observations` | `int` | `756` | Minimum training observations. `>= 252`. |
 | `min_state_occupancy` | `float` | `0.03` | Minimum state occupancy. `[0, 0.5)`. |
 | `features` | `tuple[str, ...]` | `("trailing_return", "realised_vol", "vix_term_spread", "absorption_delta", "mean_correlation")` | Observation vector; all entries must be fields of `FeatureSnapshot`. |
+
+**Validations**
+
+- When the effective ranking method (`ranking_method` or the classifier default) is `stress`, at least one entry of `features` must be a key of the effective `stress_signs`.
+- `effective_stress_signs` property: `stress_signs` if set, else `STRESS_SIGNS`.
 
 ### 1.4 `BacktestSettings`
 
@@ -154,7 +164,7 @@ Submodules are reachable but considered reorganizable internals.
   - `fetch(symbols, start, end) -> pd.DataFrame`
 - `ProviderError` — operational exception.
 - `OHLCV_FIELDS: tuple[str, ...] = ("open", "high", "low", "close", "volume")`
-- `resolve_provider(settings: Settings) -> PriceProvider` — instantiates the configured provider.
+- `resolve_provider(settings: Settings) -> PriceProvider` — instantiates the configured provider. With `provider="yfinance"` and `volatility_source="official"`, it returns a `VolatilityRoutingProvider` so `vix_symbol`/`vix3m_symbol` are served by `OfficialVolatilityProvider` and everything else by `YahooProvider`; `synthetic` and `parquet` are never wrapped.
 - `validate_panel(panel: pd.DataFrame) -> None` — validates the panel contract.
 - `empty_panel(symbols=()) -> pd.DataFrame` — valid empty panel.
 - `normalise_index(frame) -> pd.DataFrame` — cleans the index (tz, duplicates, order).
@@ -165,6 +175,8 @@ Submodules are reachable but considered reorganizable internals.
 | Class | `__init__` parameters | `is_point_in_time` | Notes |
 |-------|------------------------|--------------------|-------|
 | `YahooProvider` | `auto_adjust=True`, `timeout=30` | `False` | yfinance download, adjusted by default. |
+| `OfficialVolatilityProvider` | `fallback=None` | `False` | Official-source volatility CSVs: CBOE first, FRED fallback, then `fallback` per date; `name` encodes the chain (`official-vol[cboe>fred>…]`). |
+| `VolatilityRoutingProvider` | `equity`, `volatility`, `volatility_symbols` | `equity and volatility` | Routes the configured volatility indices to `volatility`, all other symbols to `equity`. |
 | `SyntheticProvider` | `seed=20260831` | `True` | Deterministic synthetic generator with known latent states; `latent_states(start, end) -> pd.Series[int]`. |
 | `ParquetProvider` | `root`, `strict=True` | `False` | Reads `root/<symbol>.parquet` (`^` normalized to `_`). |
 
@@ -256,6 +268,9 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
   - Properties: `risk_rank`, `is_risk_on`
 - `REGIME_LADDER: tuple[MarketRegime, ...]` — canonical risk-on to risk-off order.
 - `regime_ladder(n_states) -> tuple[MarketRegime, ...]` — returns the sub-ladder for 2, 3, or 4 states.
+- `RankingMethod(StrEnum)`: `SHARPE`, `MEAN_RETURN`, `VOLATILITY`, `STRESS` — state ranking strategies (re-exported from `regimelab.models.labeling`).
+- `STRESS_SIGNS: Final[Mapping[str, Literal[-1, 1]]]` — default stress sign per feature for `STRESS` ranking: volatility and absorption `+1`, VIX term spread, trailing return and breadth `-1`; `mean_correlation` excluded (its sign under stress changes across eras). Replaced wholesale by `ModelSettings.stress_signs`.
+- `DEFAULT_RANKING_METHODS: Final[Mapping[str, RankingMethod]]` — `{"hmm": STRESS, "hamilton": STRESS, "gmm": VOLATILITY}`; the single source of truth for the classifier `ranking_method` ClassVars and `ModelSettings.ranking_method=None`.
 - `RegimeProbabilities`:
   - `probabilities: dict[MarketRegime, float]`
   - Properties: `argmax -> MarketRegime`, `confidence -> float`, `entropy -> float`, `normalised_entropy -> float`, `risk_off_mass -> float`
@@ -269,8 +284,9 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 - `ModelMetadata`:
   - Fields: `name`, `n_states`, `seed`, `train_start`, `train_end`, `n_train_observations`, `converged`, `log_likelihood`, `feature_names`
 - `TelemetryPayload`:
-  - Fields: `asof`, `regime`, `probabilities`, `features`, `model`, `target_weights`, `warnings`
-  - Validators: `model.train_end <= asof` (last line of defence against look-ahead), regime consistency vs. probabilities.
+  - Fields: `asof`, `session_date`, `observation_date`, `regime`, `probabilities`, `features`, `model`, `target_weights`, `warnings`
+  - Property: `is_stale -> bool` (`observation_date < session_date`)
+  - Validators: `model.train_end <= asof` (last line of defence against look-ahead), `observation_date <= session_date <= asof`, regime consistency vs. probabilities.
 
 #### 2.6.2 `regimelab.models.base`
 
@@ -282,7 +298,7 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 - `StateEstimate` (dataclass): `posteriors`, `emission`, `transition`, `log_likelihood`, `converged`
 - `FittedRegime` (dataclass):
   - `classifier`, `estimate`, `assignment`, `standardiser`, `metadata`
-  - Methods: `probabilities(features, initial=None) -> pd.DataFrame`, `labels(features) -> pd.Series`, `probabilities_at(features, asof) -> RegimeProbabilities`, `transition_matrix() -> pd.DataFrame`, `expected_durations() -> pd.Series`
+  - Methods: `probabilities(features, initial=None) -> pd.DataFrame`, `labels(features) -> pd.Series`, `probabilities_at(features, asof) -> RegimeProbabilities`, `posterior_at(features, asof) -> tuple[RegimeProbabilities, pd.Timestamp]`, `transition_matrix() -> pd.DataFrame`, `expected_durations() -> pd.Series`
 - `RegimeModel(ABC)`:
   - `name: ClassVar[str]`, `ranking_method: ClassVar[RankingMethod]`
   - `__init__(settings: ModelSettings)`
@@ -292,7 +308,7 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 #### 2.6.3 `regimelab.models.hmm`
 
 - `HiddenMarkovRegimeModel(RegimeModel)`
-  - `name = "hmm"`, `ranking_method = RankingMethod.SHARPE`
+  - `name = "hmm"`, `ranking_method = RankingMethod.STRESS`
   - `_estimate` uses `hmmlearn.hmm.GaussianHMM` with `n_init` deterministic restarts.
 
 #### 2.6.4 `regimelab.models.gmm`
@@ -304,7 +320,7 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 #### 2.6.5 `regimelab.models.hamilton`
 
 - `MarkovSwitchingRegimeModel(RegimeModel)`
-  - `name = "hamilton"`, `ranking_method = RankingMethod.SHARPE`
+  - `name = "hamilton"`, `ranking_method = RankingMethod.STRESS`
   - `__init__(settings, *, dependent_index=0, switching_variance=True)`
   - `_estimate` uses `statsmodels.tsa.regime_switching.markov_regression.MarkovRegression`.
 
@@ -315,12 +331,14 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 
 #### 2.6.7 `regimelab.models.labeling`
 
-- `RankingMethod(StrEnum)`: `SHARPE`, `MEAN_RETURN`, `VOLATILITY`
+- `RankingMethod` — re-exported from `regimelab.models.types` (`SHARPE`, `MEAN_RETURN`, `VOLATILITY`, `STRESS`)
+- `STRESS_SIGNS` — default signed stress contribution per feature, defined in `regimelab.models.types` and re-exported here (`mean_correlation` excluded: its stress sign is unstable across eras; see `ModelSettings.stress_signs` for configuration)
 - `OccupancyError(ValueError)`
-- `StateStatistics` (dataclass): `state`, `occupancy`, `mean_return`, `volatility`, `n_observations`; property `sharpe`
+- `StateStatistics` (dataclass): `state`, `occupancy`, `mean_return`, `volatility`, `n_observations`, `stress_score`; property `sharpe`
 - `LabelAssignment` (dataclass): `mapping`, `statistics`, `method`; property `inverse`; methods `regime_of(state)`, `describe() -> pd.DataFrame`
 - `summarise_states(reference_returns, posteriors, *, trading_days=252) -> tuple[StateStatistics, ...]`
-- `assign_labels(statistics, *, method=SHARPE, min_occupancy=0.0) -> LabelAssignment`
+- `stress_scores(emission_means, feature_names, *, signs=STRESS_SIGNS) -> np.ndarray` — mean signed standardised emission mean per state over the `signs` features
+- `assign_labels(statistics, *, method=SHARPE, min_occupancy=0.0, emission_means=None, feature_names=None, signs=STRESS_SIGNS) -> LabelAssignment` — `emission_means`/`feature_names` required under `STRESS`, `signs` forwarded to `stress_scores`; the positive-drift guardrail does not apply under `STRESS`
 - `relabel_probabilities(posteriors, assignment) -> pd.DataFrame`
 
 #### 2.6.8 `regimelab.models.filters`
@@ -366,16 +384,20 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 - `WalkForwardFold` (dataclass): `fold_index`, `train_start`, `train_end`, `test_start`, `test_end`, `n_train`, `n_test`, `model: ModelMetadata`, `assignment: pd.DataFrame | None`
 - `WalkForwardResult` (dataclass): `labels`, `probabilities`, `confidence`, `folds`, `features`, `backtest: BacktestResult | None`
   - Property `regimes` (alias of `labels`)
-  - Method `regime_probabilities(asof) -> RegimeProbabilities`
+  - Methods: `regime_probabilities(asof) -> RegimeProbabilities`, `posterior_at(asof) -> tuple[RegimeProbabilities, pd.Timestamp]`
 - `run_walk_forward(panel, features, settings, *, run_backtest=True) -> WalkForwardResult`
+- `refit_schedule(features, settings) -> list[pd.Timestamp]` — the stepped refit dates (`min_train_observations` warmup, `refit_frequency_days` stride); prefix-stable, so truncating `features` first keeps the answer causal.
+- `oos_train_end(features, settings, date) -> pd.Timestamp` — `train_end` of the fold that labels `date`: the last scheduled refit strictly before `date`; raises `InsufficientDataError` when `date` is at or before the first refit.
+- `filter_frozen(fit, features, end) -> pd.DataFrame` — filters the whole history from the stationary distribution with the frozen parameters, starting at the first all-column complete row.
 
 **Walk-forward logic**
 
 - Expanding window: each refit uses all history up to `train_end`.
-- Refit dates determined by `min_train_observations` and `refit_frequency_days`.
-- Between refits the model is frozen; the filter advances causally.
-- The filtered posterior at the end of one segment is reused as the prior for the next to preserve Markov continuity.
-- The last segment reaches the end of the panel.
+- Refit dates determined by `min_train_observations` and `refit_frequency_days` (`refit_schedule`).
+- Between refits the model is frozen; the filter advances causally (`filter_frozen`).
+- Each fold labels only `(r_k, r_{k+1}]`; the filter runs over the whole history from the stationary distribution with frozen parameters — nothing is carried between folds, and dates at or before the first refit are unlabelled.
+- The last segment reaches the end of the panel: the final observation is appended as a fold boundary, but is never a valid `train_end` — a model trained through the last row would be labelling data it has seen.
+- `run_single_asof` reuses `oos_train_end` and `filter_frozen` so a single-date read reproduces the fold signal exactly.
 
 ### 2.8 `regimelab.pipeline` — Orchestration
 
@@ -383,7 +405,10 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
   - Property `backtest -> BacktestResult | None`
 - `latest_telemetry(result) -> TelemetryPayload`
 - `run_pipeline(settings, *, command="run", run_backtest=True) -> PipelineResult`
-- `run_single_asof(settings, asof, *, command="asof") -> TelemetryPayload`
+- `run_single_asof(settings, asof, *, command="asof", fitted=None, refit_policy="walkforward") -> TelemetryPayload`
+  - `refit_policy="walkforward"` (default): finds the last scheduled refit strictly before the last usable observation and filters with frozen parameters — reproduces the walk-forward signal exactly.
+  - `refit_policy="daily"`: previous behaviour; fits through `asof` itself.
+  - `fitted` wins over either policy: the supplied `FittedRegime` is filtered causally without retraining.
 - `RunCommand` (callable): wrapper for CLI/tests.
 
 **Artifacts written by `run_pipeline` in the `RunStore`**
@@ -436,6 +461,8 @@ Report sections:
 ```python
 TelemetryPayload(
     asof=dt.date,
+    session_date=dt.date,
+    observation_date=dt.date,
     regime=MarketRegime,
     probabilities=RegimeProbabilities,
     features=FeatureSnapshot,
@@ -446,16 +473,19 @@ TelemetryPayload(
 ```
 
 - `asof`: decision date.
+- `session_date`: last master-calendar session at or before `asof`; strictly earlier means the request fell on a non-trading day.
+- `observation_date`: date of the last complete feature row used for the posterior; `is_stale` is `observation_date < session_date` — data lag, not a calendar gap.
 - `regime`: modal regime.
 - `probabilities`: full posterior distribution (dict `MarketRegime -> float`).
 - `features`: causal systemic-risk snapshot.
 - `model`: fit metadata (name, seed, training range, etc.).
 - `target_weights`: current-regime target weights, or `None` if no backtest is configured.
-- `warnings`: operational warnings.
+- `warnings`: data-quality degradations reported by the pipeline, in order: `non_session_asof`, `stale_observation`, `missing_feature`, `stale_input`, `dropped_symbol`. The payload describes the gap but never fills it; whether to publish is the consumer's decision.
 
 **Validators**
 
 - `model.train_end <= asof` (last line of defence against look-ahead).
+- `observation_date <= session_date <= asof`.
 - `regime` must appear in `probabilities`.
 
 ### 3.2 `PipelineResult`
@@ -555,7 +585,7 @@ Example fields (Pydantic serialized to JSON):
   "python_version": "3.12.4",
   "platform": "Windows-11...",
   "packages": {
-    "regimelab": "0.1.4",
+    "regimelab": "0.2.0",
     "numpy": "2.5.2",
     "pandas": "3.0.5",
     ...
@@ -601,7 +631,7 @@ In addition, the panel cache (`settings.data.cache_dir / panels / <sha16>.parque
 
 ## 4. Test List
 
-Files: `tests/conftest.py`, `tests/test_backtest.py`, `tests/test_causality.py`.
+Files: `tests/conftest.py`, `tests/test_backtest.py`, `tests/test_causality.py`, `tests/test_labeling.py`, `tests/test_labeling_synthetic.py`, `tests/test_model_persistence.py`, `tests/test_official_volatility.py`, `tests/test_settings_env.py`, `tests/test_signal_universe.py`, `tests/test_telemetry_quality.py`. All tests run offline against the synthetic provider or fixture frames; official-volatility tests monkeypatch `_read_csv`.
 
 ### 4.1 Shared fixtures (`conftest.py`)
 
@@ -655,7 +685,51 @@ Parametrized for three dates: `2020-03-16`, `2020-06-15`, `2020-12-31`. Counts a
 11-13. **`test_asof_payload_uses_only_history_before_cursor`**  
     `run_single_asof` returns a `TelemetryPayload` whose `asof` matches the requested date and whose `features` are available on that date. Ensures the as-of endpoint does not look past the cursor.
 
-**Total: 13 test cases** (4 in `test_backtest` + 2 + 2 + 2 + 3 parametrized cases in `test_causality`).
+14. **`test_asof_walkforward_reproduces_walkforward_signal`**  
+    For OOS dates spanning the sample — including the first OOS date and a fold `test_end` boundary — the default `refit_policy="walkforward"` payload reproduces `walkforward.probabilities` (atol `1e-10`), `walkforward.labels`, and the owning fold's `train_end`.
+
+15. **`test_asof_walkforward_rejects_pre_oos_dates`**  
+    An as-of date at or before `folds[0].train_end` raises `InsufficientDataError`: no out-of-sample model exists for it.
+
+16. **`test_asof_daily_refit_policy_keeps_old_behaviour`**  
+    `refit_policy="daily"` fits through the as-of date, so `payload.model.train_end == asof`.
+
+### 4.4 `tests/test_labeling.py`
+
+- STRESS ranking orders states by signed emission means over `STRESS_SIGNS`, is bijective even when all drifts are positive (the positive-drift guardrail is skipped), and breaks ties on volatility then state index.
+- SHARPE/MEAN_RETURN/VOLATILITY behaviours, including the drift guardrail and aggregate-duplicate relabelling.
+- `ModelSettings.ranking_method` overrides the classifier default.
+- `ModelSettings.stress_signs` replaces `STRESS_SIGNS` entirely: custom signs change the fitted assignment, coverage is validated only when STRESS is in effect, and each registry classifier's `ranking_method` ClassVar equals `DEFAULT_RANKING_METHODS[name]`.
+
+### 4.5 `tests/test_labeling_synthetic.py`
+
+- On synthetic data with known latent states, STRESS labelling recovers the stress state and emits every canonical regime exactly once.
+
+### 4.6 `tests/test_model_persistence.py`
+
+- `FittedRegimeBundle` save/load round-trips the frozen model.
+- `run_single_asof(settings, asof, fitted=fit)` reuses the persisted model without refitting.
+
+### 4.7 `tests/test_official_volatility.py`
+
+- CBOE/FRED CSV parsing, per-date source priority, CBOE failure → FRED fallback, both-official failure → configured-provider fallback, inclusive range clipping.
+- `VolatilityRoutingProvider` splits symbol groups; `resolve_provider` routing matrix; cache key differentiates `volatility_source`.
+
+### 4.8 `tests/test_settings_env.py`
+
+- Environment-variable overrides map only to `REGIMELAB_*` prefixed names and reject invalid values.
+
+### 4.9 `tests/test_signal_universe.py`
+
+- Changing `risk_assets` (with matching `regime_weights`) leaves the feature matrix identical; changing `correlation_assets` changes `mean_correlation`.
+- `correlation_assets` validator requires at least two symbols; symbols not in `risk_assets` still reach `all_symbols` through `correlation_assets`.
+
+### 4.10 `tests/test_telemetry_quality.py`
+
+- `TelemetryPayload` validators enforce `observation_date <= session_date <= asof`; `is_stale` compares the observation to the session, not the calendar.
+- Data gaps produce, in order, `non_session_asof`, `stale_observation`, `missing_feature`, `stale_input`, `dropped_symbol` warnings; clean sessions produce none.
+
+**Total: 65 collected test cases** (the parametrized as-of fixture counts as 3).
 
 ---
 

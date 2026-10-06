@@ -18,7 +18,9 @@ def test_settings_ignores_unrelated_environment_variables(monkeypatch: pytest.Mo
     assert settings is not None
 
 
-def test_settings_still_maps_prefixed_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_settings_still_maps_prefixed_environment_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Recognised REGIMELAB_ variables must keep overriding defaults."""
     monkeypatch.setenv("REGIMELAB_MODEL__N_STATES", "3")
 

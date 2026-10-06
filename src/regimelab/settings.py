@@ -18,6 +18,7 @@ Resolution order (highest precedence first):
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Literal, Self
 
@@ -30,7 +31,13 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
-from regimelab.models.types import FeatureSnapshot, MarketRegime
+from regimelab.models.types import (
+    DEFAULT_RANKING_METHODS,
+    STRESS_SIGNS,
+    FeatureSnapshot,
+    MarketRegime,
+    RankingMethod,
+)
 
 __all__ = [
     "BacktestSettings",
@@ -50,14 +57,30 @@ class _Section(BaseModel):
 
 
 class DataSettings(_Section):
-    """Universe definition and ingestion behaviour."""
+    """Universe definition and ingestion behaviour.
+
+    Two universes are deliberately kept apart. The **signal** universe --
+    ``cross_section``, ``correlation_assets``, ``vix_symbol`` and
+    ``vix3m_symbol`` -- feeds the feature matrix. The **investable** universe
+    -- ``risk_assets``, constrained by ``backtest.regime_weights`` -- is used
+    only by the backtest and allocation. Changing the investable universe must
+    never change a model feature.
+    """
 
     provider: ProviderName = "yfinance"
     """Default provider. ``parquet`` reads a frozen local snapshot and is what
     CI uses, so the test suite is offline and deterministic."""
 
+    volatility_source: Literal["official", "provider"] = "official"
+    """How ``vix_symbol``/``vix3m_symbol`` are sourced under ``provider="yfinance"``:
+    ``official`` uses CBOE then FRED with the equity provider as fallback;
+    ``provider`` asks the equity provider directly. ``synthetic`` stays offline
+    (its indices are generated consistently with the latent states) and
+    ``parquet`` is the frozen snapshot, so this setting only affects yfinance."""
+
     risk_assets: tuple[str, ...] = ("SPY", "TLT", "GLD")
-    """Allocatable sleeves for the adaptive backtest."""
+    """Allocatable sleeves for the backtest and allocation only -- the model
+    features never read this list."""
 
     benchmark: str = "SPY"
     """Buy-and-hold benchmark for the performance attribution."""
@@ -87,6 +110,12 @@ class DataSettings(_Section):
     XLC (2018) are excluded so the panel width does not change mid-sample.
     """
 
+    correlation_assets: tuple[str, ...] = ("SPY", "TLT", "GLD")
+    """Universe of the cross-asset correlation features, independent of
+    ``risk_assets``. If ``benchmark`` is absent from this list the
+    ``defensive_correlation`` diagnostic column is all NaN -- the returns frame
+    only covers these symbols -- but the model features are unaffected."""
+
     start: dt.date = dt.date(2005, 1, 1)
     end: dt.date | None = None
     """Ingestion bounds. ``None`` means "up to the latest available session"."""
@@ -106,6 +135,7 @@ class DataSettings(_Section):
         symbols = {
             *self.risk_assets,
             *self.cross_section,
+            *self.correlation_assets,
             self.benchmark,
             self.vix_symbol,
             self.vix3m_symbol,
@@ -117,6 +147,9 @@ class DataSettings(_Section):
     def _check_universe(self) -> Self:
         if len(self.cross_section) < 3:
             msg = "the absorption ratio needs a cross-section of at least 3 assets"
+            raise ValueError(msg)
+        if len(self.correlation_assets) < 2:
+            msg = "correlation features need at least 2 correlation_assets"
             raise ValueError(msg)
         if self.end is not None and self.end <= self.start:
             msg = f"end {self.end} must be after start {self.start}"
@@ -176,6 +209,19 @@ class ModelSettings(_Section):
     """Latent-state classifier configuration."""
 
     classifier: Literal["hmm", "gmm", "hamilton"] = "hmm"
+    ranking_method: RankingMethod | None = None
+    """``None`` means the classifier default (``hmm`` and ``hamilton``: stress,
+    ``gmm``: volatility)."""
+
+    stress_signs: dict[str, Literal[-1, 1]] | None = None
+    """Signed contribution of each named feature to the STRESS ranking score.
+    ``None`` uses :data:`~regimelab.models.types.STRESS_SIGNS`; a dict replaces
+    it entirely and is never merged. The defaults are a reasoned convention:
+    volatility and absorption rising means stress, while the VIX term spread,
+    trailing return and breadth rising means calm; ``mean_correlation`` is
+    excluded because the sign of stock/bond correlation under stress changes
+    across eras."""
+
     n_states: Annotated[int, Field(ge=2, le=4)] = 4
     seed: int = 20260831
     """Fixed seed. EM is initialisation-sensitive, so an unseeded fit is not
@@ -220,6 +266,29 @@ class ModelSettings(_Section):
     Ordering is part of the contract: reordering changes the fitted covariance
     parameterisation and therefore the results.
     """
+
+    @property
+    def effective_stress_signs(self) -> Mapping[str, int]:
+        """Stress signs actually in force: ``stress_signs`` if set, else the
+        defaults. ``None`` is the only trigger for the defaults -- an empty
+        dict stays an empty dict and fails the coverage check below."""
+        return self.stress_signs if self.stress_signs is not None else STRESS_SIGNS
+
+    @model_validator(mode="after")
+    def _check_stress_signs(self) -> Self:
+        """Under STRESS ranking, at least one configured feature must be signed."""
+        method = self.ranking_method or DEFAULT_RANKING_METHODS[self.classifier]
+        if method is not RankingMethod.STRESS:
+            return self
+        signs = self.effective_stress_signs
+        if not any(name in signs for name in self.features):
+            msg = (
+                f"no feature among model.features {list(self.features)} carries a "
+                f"stress sign (signed keys: {sorted(signs)}); adjust "
+                "model.stress_signs or model.ranking_method"
+            )
+            raise ValueError(msg)
+        return self
 
 
 class BacktestSettings(_Section):

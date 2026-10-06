@@ -6,17 +6,22 @@ next refit. Crucially, the parameters estimated at :math:`t_k` are **frozen**
 while the filter is advanced: the model cannot see any observation used in its
 out-of-sample classification.
 
-The loop also reuses the filtered posterior at the end of one training window as
-the prior for the next segment, so the state continuity is preserved across
-refits rather than resetting to the stationary distribution each time. This
-matters for HMM-style classifiers: an abrupt reset would make the first few
-out-of-sample days of every fold behave like a cold start, biasing turnover and
-drawdown estimates.
+Each fold model is solely responsible for the interval :math:`(t_k, t_{k+1}]`:
+the filter is run over the whole history from the stationary distribution with
+the parameters frozen at :math:`t_k` -- causal, and independent of the previous
+fold's model -- and only that interval is kept. Dates at or before the first
+refit are never labelled, so no session is classified by a model that trained
+on it.
 
 The default is an **expanding window**: each refit uses all data from the start
 of the panel up to the refit date. A fixed rolling window would discard
 recession data during calm periods, which is exactly when the model most needs
 to remember what tail risk looks like.
+
+The fold machinery is exposed as :func:`refit_schedule`, :func:`oos_train_end`
+and :func:`filter_frozen` so that
+:func:`regimelab.pipeline.run_single_asof` can reproduce the walk-forward
+signal for a single date without reimplementing any of it.
 """
 
 from __future__ import annotations
@@ -26,10 +31,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-import numpy as np
 import pandas as pd
 
 from regimelab.backtest.engine import run_backtest as run_backtest_engine
+from regimelab.models.base import InsufficientDataError, probabilities_from_row
 from regimelab.models.registry import build_classifier
 from regimelab.models.types import MarketRegime, ModelMetadata, RegimeProbabilities
 
@@ -39,7 +44,14 @@ if TYPE_CHECKING:
     from regimelab.models.base import FittedRegime
     from regimelab.settings import Settings
 
-__all__ = ["WalkForwardFold", "WalkForwardResult", "run_walk_forward"]
+__all__ = [
+    "WalkForwardFold",
+    "WalkForwardResult",
+    "filter_frozen",
+    "oos_train_end",
+    "refit_schedule",
+    "run_walk_forward",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,24 +101,34 @@ class WalkForwardResult:
         """Alias for ``labels``."""
         return self.labels
 
-    def regime_probabilities(self, asof: dt.date | pd.Timestamp) -> RegimeProbabilities:
-        """Validated posterior at the most recent date at or before ``asof``."""
+    def posterior_at(
+        self,
+        asof: dt.date | pd.Timestamp,
+    ) -> tuple[RegimeProbabilities, pd.Timestamp]:
+        """Validated posterior at the most recent labelled date at or before ``asof``.
+
+        Also returns the date that produced it, which is earlier than ``asof``
+        whenever the newest sessions have no complete feature row.
+        """
         truncated = self.probabilities.loc[: pd.Timestamp(asof)]
         if truncated.empty:
             msg = f"no walk-forward probability at or before {asof}"
             raise KeyError(msg)
-        row = truncated.iloc[-1]
-        return RegimeProbabilities(
-            probabilities={MarketRegime(str(name)): float(value) for name, value in row.items()},
-        )
+        return probabilities_from_row(truncated.iloc[-1]), truncated.index[-1]
+
+    def regime_probabilities(self, asof: dt.date | pd.Timestamp) -> RegimeProbabilities:
+        """Validated posterior at the most recent date at or before ``asof``."""
+        return self.posterior_at(asof)[0]
 
 
-def _refit_dates(features: pd.DataFrame, settings: Settings) -> list[pd.Timestamp]:
-    """Training window end dates for each fold.
+def refit_schedule(features: pd.DataFrame, settings: Settings) -> list[pd.Timestamp]:
+    """Scheduled training-window end dates for each fold.
 
     The first fold uses the earliest feature row that satisfies
-    ``min_train_observations`` and the feature warmup. Subsequent folds advance by
-    ``model.refit_frequency_days``.
+    ``min_train_observations`` and the feature warmup. Subsequent folds
+    advance by ``backtest.refit_frequency_days``. The stepped schedule is
+    prefix-stable: truncating ``features`` and recomputing yields the same
+    dates up to the truncation point.
     """
     full = features.dropna(how="any")
     if len(full) < settings.model.min_train_observations:
@@ -117,30 +139,83 @@ def _refit_dates(features: pd.DataFrame, settings: Settings) -> list[pd.Timestam
         raise ValueError(msg)
 
     first = settings.model.min_train_observations - 1
-    starts = full.index[first :: settings.backtest.refit_frequency_days]
+    return list(full.index[first :: settings.backtest.refit_frequency_days])
 
-    # Always include the final observation as a refit point so the last fold
-    # reaches the end of the sample.
+
+def _refit_dates(features: pd.DataFrame, settings: Settings) -> list[pd.Timestamp]:
+    """Scheduled refits plus the final observation as an interval sentinel.
+
+    The appended last date terminates the final fold's interval; it is never a
+    valid ``train_end`` -- a model trained through the last row would be
+    labelling data it has seen. :func:`oos_train_end` therefore reads only
+    :func:`refit_schedule`.
+    """
+    starts = refit_schedule(features, settings)
+    full = features.dropna(how="any")
+
+    # Always include the final observation so the last fold reaches the end
+    # of the sample.
     if full.index[-1] not in starts:
-        starts = starts.append(pd.DatetimeIndex([full.index[-1]]))
+        starts.append(full.index[-1])
 
-    return list(starts)
+    return starts
 
 
-def _filter_segment(
+def oos_train_end(
+    features: pd.DataFrame,
+    settings: Settings,
+    date: pd.Timestamp,
+) -> pd.Timestamp:
+    """The ``train_end`` of the walk-forward fold that labels ``date``.
+
+    The last scheduled refit strictly before ``date``. Truncating the feature
+    matrix at ``date`` first keeps the answer causal, and the stepped
+    schedule's prefix-stability makes it equal the full-run schedule.
+
+    Raises
+    ------
+    InsufficientDataError
+        If ``date`` is at or before the first refit, so no out-of-sample
+        walk-forward model exists for it.
+    """
+    try:
+        schedule = refit_schedule(features.loc[:date], settings)
+    except ValueError:
+        schedule = []
+
+    eligible = [d for d in schedule if d < date]
+    if eligible:
+        return eligible[-1]
+
+    full = features.dropna(how="any")
+    first_refit = (
+        full.index[settings.model.min_train_observations - 1]
+        if len(full) >= settings.model.min_train_observations
+        else None
+    )
+    detail = f" (first scheduled refit: {first_refit.date()})" if first_refit is not None else ""
+    msg = f"no out-of-sample walk-forward model exists for {date.date()}{detail}"
+    raise InsufficientDataError(msg)
+
+
+def filter_frozen(
     fit: FittedRegime,
     features: pd.DataFrame,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-    initial: np.ndarray | None,
+    end: dt.date | pd.Timestamp,
 ) -> pd.DataFrame:
-    """Filter a span from ``start`` to ``end`` with the provided initial state.
+    """Filter the whole history from the stationary distribution.
 
-    The initial distribution is the filtered posterior at the end of the
-    preceding training or test segment, preserving Markov continuity.
+    The parameters frozen into ``fit`` are applied causally over
+    ``features`` up to ``end``. The filter starts at the first *all-column*
+    complete row rather than ``features.index[0]``: a row whose model features
+    are complete while a diagnostic column is NaN would otherwise change the
+    filtered path.
     """
-    segment = features.loc[start:end]
-    return fit.probabilities(segment, initial=initial)
+    full = features.dropna(how="any")
+    if full.empty:
+        msg = "feature matrix has no complete rows"
+        raise InsufficientDataError(msg)
+    return fit.probabilities(features.loc[full.index[0] : end], initial=None)
 
 
 def run_walk_forward(
@@ -191,53 +266,46 @@ def run_walk_forward(
     all_probabilities: list[pd.DataFrame] = []
     all_folds: list[WalkForwardFold] = []
 
-    # Start the filter from the stationary distribution on the first fold; for
-    # subsequent folds use the posterior at the previous refit date.
-    initial: np.ndarray | None = None
-
-    total_folds = len(refit_dates)
+    # Fold k labels the interval (r_k, r_{k+1}]; the last refit point would
+    # cover (r_last, last feature date], which is empty because _refit_dates
+    # always appends the final observation. Empty intervals are skipped before
+    # fitting so no model is trained for a fold that produces no labels.
+    intervals: list[tuple[pd.Timestamp, pd.Timestamp]] = []
     for fold_index, train_end in enumerate(refit_dates):
-        is_last = fold_index == total_folds - 1
-
-        # Out-of-sample segment is (prev_train_end, current_train_end], except
-        # for the final fold, which is (prev_train_end, last_feature_date].
-        test_start = full.index[0] if fold_index == 0 else refit_dates[fold_index - 1]
-
+        is_last = fold_index + 1 == len(refit_dates)
         test_end = full.index[-1] if is_last else refit_dates[fold_index + 1]
+        if full.loc[train_end:test_end].shape[0] <= 1:
+            continue
+        intervals.append((train_end, test_end))
 
+    # Training always starts from the earliest complete feature row.
+    train_start = full.index[0]
+
+    total_folds = len(intervals)
+    for fold_index, (train_end, test_end) in enumerate(intervals):
         if progress_callback is not None:
             progress_callback(fold_index + 1, total_folds, test_end.date().isoformat())
 
-        # Training always starts from the earliest complete feature row.
-        train_start = full.index[0]
-
         fit = model.fit(features, reference_returns, train_end=train_end)
 
-        # Filter the segment. If this is not the last fold, it is exactly one
-        # refit step long; if it is the last, it runs to the end of the data.
-        probs = _filter_segment(fit, features, test_start, test_end, initial=initial)
+        # Filter the whole history from the stationary distribution with the
+        # parameters frozen at train_end, then keep only this fold's interval
+        # (train_end, test_end].
+        hist = filter_frozen(fit, features, test_end)
+        probs = hist.loc[hist.index > train_end]
 
-        # Save the posterior at the end of this segment as the next prior.
-        if not probs.empty:
-            initial = probs.iloc[-1].to_numpy(dtype="float64")
-            # First fold only: we keep the entire segment. Subsequent folds
-            # overlap at test_start with the previous fold's end; drop the first
-            # row to avoid duplicating the refit boundary.
-            if fold_index > 0:
-                probs = probs.iloc[1:]
-            all_probabilities.append(probs)
-
+        all_probabilities.append(probs)
         all_folds.append(
             WalkForwardFold(
                 fold_index=fold_index,
                 train_start=train_start.date(),
                 train_end=train_end.date(),
-                test_start=test_start.date(),
+                test_start=probs.index[0].date(),
                 test_end=test_end.date(),
                 n_train=features.loc[train_start:train_end].dropna(how="any").shape[0],
                 n_test=probs.shape[0],
                 model=fit.metadata,
-                assignment=fit.assignment.describe() if not probs.empty else None,
+                assignment=fit.assignment.describe(),
             ),
         )
 
@@ -245,8 +313,15 @@ def run_walk_forward(
         msg = "walk-forward produced no probability path"
         raise ValueError(msg)
 
-    probabilities = pd.concat(all_probabilities, sort=False)
-    probabilities = probabilities[~probabilities.index.duplicated(keep="last")].sort_index()
+    # Fold intervals are disjoint by construction, so concatenation is exact.
+    probabilities = pd.concat(all_probabilities, sort=False).sort_index()
+    duplicated = probabilities.index[probabilities.index.duplicated()]
+    if len(duplicated):
+        msg = (
+            f"walk-forward fold intervals overlap on {len(duplicated)} dates, "
+            f"e.g. {[d.date().isoformat() for d in duplicated[:5]]}"
+        )
+        raise ValueError(msg)
 
     # Modal regime with the canonical risk-off tie-break.
     ranked = sorted(probabilities.columns, key=lambda c: MarketRegime(str(c)).risk_rank)

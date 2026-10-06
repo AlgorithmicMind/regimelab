@@ -14,12 +14,14 @@ from regimelab.models.gmm import GaussianMixtureRegimeModel
 from regimelab.models.hamilton import MarkovSwitchingRegimeModel
 from regimelab.models.hmm import HiddenMarkovRegimeModel
 from regimelab.models.labeling import (
+    STRESS_SIGNS,
     LabelAssignment,
     OccupancyError,
     RankingMethod,
     StateStatistics,
     assign_labels,
     relabel_probabilities,
+    stress_scores,
     summarise_states,
 )
 from regimelab.models.registry import CLASSIFIERS, build_classifier
@@ -37,6 +39,7 @@ from regimelab.models.types import (
 __all__ = [
     "CLASSIFIERS",
     "REGIME_LADDER",
+    "STRESS_SIGNS",
     "AllocationWeights",
     "CausalStandardiser",
     "FeatureSnapshot",
@@ -62,5 +65,6 @@ __all__ = [
     "gaussian_log_density",
     "regime_ladder",
     "relabel_probabilities",
+    "stress_scores",
     "summarise_states",
 ]

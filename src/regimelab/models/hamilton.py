@@ -48,7 +48,7 @@ from regimelab.models.base import (
     RegimeModel,
     StateEstimate,
 )
-from regimelab.models.labeling import RankingMethod
+from regimelab.models.types import DEFAULT_RANKING_METHODS, RankingMethod
 
 if TYPE_CHECKING:
     from regimelab.settings import ModelSettings
@@ -76,7 +76,7 @@ class MarkovSwitchingRegimeModel(RegimeModel):
     """
 
     name: ClassVar[str] = "hamilton"
-    ranking_method: ClassVar[RankingMethod] = RankingMethod.SHARPE
+    ranking_method: ClassVar[RankingMethod] = DEFAULT_RANKING_METHODS[name]
 
     def __init__(
         self,

@@ -18,17 +18,22 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+from collections.abc import Mapping
 from enum import StrEnum
-from typing import Annotated, Self
+from types import MappingProxyType
+from typing import Annotated, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
+    "DEFAULT_RANKING_METHODS",
     "REGIME_LADDER",
+    "STRESS_SIGNS",
     "AllocationWeights",
     "FeatureSnapshot",
     "MarketRegime",
     "ModelMetadata",
+    "RankingMethod",
     "RegimeProbabilities",
     "TelemetryPayload",
     "regime_ladder",
@@ -115,6 +120,65 @@ def regime_ladder(n_states: int) -> tuple[MarketRegime, ...]:
         supported = ", ".join(str(k) for k in sorted(_LADDERS))
         msg = f"no regime ladder defined for n_states={n_states} (supported: {supported})"
         raise ValueError(msg) from None
+
+
+class RankingMethod(StrEnum):
+    """Strategy for ordering latent states from risk-on to risk-off."""
+
+    SHARPE = "sharpe"
+    """Rank by ``mean_return / volatility``. The default: it blends both
+    dimensions, so a state with modest drift and very low volatility correctly
+    ranks above one with similar drift and crisis-level volatility."""
+
+    MEAN_RETURN = "mean_return"
+    """Rank by conditional mean return alone. Cleaner to explain, but it cannot
+    distinguish a calm grind higher from a violent bear-market rally."""
+
+    VOLATILITY = "volatility"
+    """Rank by ascending conditional volatility. Appropriate when the model is
+    fitted purely on volatility features and drift is not identified."""
+
+    STRESS = "stress"
+    """Rank by the mean signed standardised emission mean over features with a
+    known stress sign (:data:`STRESS_SIGNS`). Higher
+    stress sorts more risk-off; the positive-drift guardrail does not apply."""
+
+
+# Sign of each feature's contribution to the stress score: +1 means a higher
+# standardised emission mean indicates more stress, -1 the opposite.
+#
+# The defaults are a reasoned convention, not measured ground truth: realised
+# volatility and the absorption measures going up means stress; the VIX term
+# spread, trailing return and breadth going up means calm.
+# ``mean_correlation`` is deliberately excluded: on real data (SPY plus a
+# sector/defensive universe, 2008-2026) the crisis state shows the *lowest*
+# mean cross-asset correlation -- stock/bond correlation goes negative under
+# stress -- so its sign is not stable across eras. A configuration that
+# disagrees supplies ``ModelSettings.stress_signs``, which replaces this table
+# entirely; the two are never merged.
+STRESS_SIGNS: Final[Mapping[str, Literal[-1, 1]]] = MappingProxyType(
+    {
+        "realised_vol": +1,
+        "vix_term_spread": -1,
+        "absorption_delta": +1,
+        "absorption_ratio": +1,
+        "trailing_return": -1,
+        "breadth": -1,
+        "breadth_momentum": -1,
+    },
+)
+"""Default signed stress contribution per feature, used when
+``ModelSettings.stress_signs`` is ``None``."""
+
+# Single source of truth for each classifier's default ranking method: the
+# ``ranking_method`` ClassVar on every model and the ``None`` branch of
+# ``ModelSettings`` both read this table.
+DEFAULT_RANKING_METHODS: Final[Mapping[str, RankingMethod]] = {
+    "hmm": RankingMethod.STRESS,
+    "hamilton": RankingMethod.STRESS,
+    "gmm": RankingMethod.VOLATILITY,
+}
+"""Default :class:`RankingMethod` per classifier name."""
 
 
 class _Frozen(BaseModel):
@@ -320,12 +384,37 @@ class TelemetryPayload(_Frozen):
     asof: dt.date
     """Decision date. All inputs are observable at or before this date."""
 
+    session_date: dt.date
+    """Last master-calendar session at or before ``asof``."""
+
+    observation_date: dt.date
+    """Date of the last complete feature row used for the posterior."""
+
     regime: MarketRegime
     probabilities: RegimeProbabilities
     features: FeatureSnapshot
     model: ModelMetadata
     target_weights: AllocationWeights | None = None
     warnings: tuple[str, ...] = ()
+
+    @property
+    def is_stale(self) -> bool:
+        """Whether the posterior was computed on data older than the latest
+        session -- a data problem, not a calendar one."""
+        return self.observation_date < self.session_date
+
+    @model_validator(mode="after")
+    def _check_session_ordering(self) -> Self:
+        if self.observation_date > self.session_date:
+            msg = (
+                f"observation_date {self.observation_date} is after "
+                f"session_date {self.session_date}"
+            )
+            raise ValueError(msg)
+        if self.session_date > self.asof:
+            msg = f"session_date {self.session_date} is after asof {self.asof}"
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _check_causality(self) -> Self:

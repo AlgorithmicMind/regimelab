@@ -19,6 +19,11 @@ from regimelab.data.providers.base import (
     panel_from_symbol_frames,
     validate_panel,
 )
+from regimelab.data.providers.official import (
+    SUPPORTED_SYMBOLS,
+    OfficialVolatilityProvider,
+    VolatilityRoutingProvider,
+)
 from regimelab.data.providers.parquet import ParquetProvider, write_snapshot
 from regimelab.data.providers.synthetic import SyntheticProvider
 from regimelab.data.providers.yahoo import YahooProvider
@@ -28,10 +33,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     "OHLCV_FIELDS",
+    "SUPPORTED_SYMBOLS",
+    "OfficialVolatilityProvider",
     "ParquetProvider",
     "PriceProvider",
     "ProviderError",
     "SyntheticProvider",
+    "VolatilityRoutingProvider",
     "YahooProvider",
     "empty_panel",
     "normalise_index",
@@ -65,7 +73,23 @@ def resolve_provider(settings: Settings) -> PriceProvider:
     name: str = settings.data.provider
 
     if name == "yfinance":
-        return YahooProvider()
+        # Routing is deliberate about which providers it wraps: ``synthetic``
+        # must stay offline with its indices consistent with the latent-state
+        # path, and ``parquet`` is the frozen reproducibility snapshot. Only
+        # the live yfinance path gets the official-source overlay.
+        equity = YahooProvider()
+        if settings.data.volatility_source == "official":
+            vol_symbols = {
+                settings.data.vix_symbol,
+                settings.data.vix3m_symbol,
+            } & SUPPORTED_SYMBOLS.keys()
+            if vol_symbols:
+                return VolatilityRoutingProvider(
+                    equity,
+                    OfficialVolatilityProvider(fallback=equity),
+                    vol_symbols,
+                )
+        return equity
     if name == "synthetic":
         return SyntheticProvider(seed=settings.model.seed)
     if name == "parquet":

@@ -7,16 +7,21 @@ coderesting: a trading decision depend on information not yet available.
 from __future__ import annotations
 
 import datetime as dt
+from itertools import pairwise
 
 import hypothesis.strategies as st
+import numpy as np
 import pandas as pd
 import pytest
 from hypothesis import HealthCheck, given, settings
 
+from regimelab.backtest.walkforward import _refit_dates, run_walk_forward
 from regimelab.data.alignment import align_panel, truncate_asof
 from regimelab.data.fetcher import PanelFetcher
 from regimelab.data.providers import resolve_provider
 from regimelab.features import build_feature_matrix, snapshot_at
+from regimelab.models.base import InsufficientDataError
+from regimelab.models.types import MarketRegime
 from regimelab.pipeline import PipelineResult, run_single_asof
 from regimelab.settings import Settings
 
@@ -108,20 +113,102 @@ class TestWalkForward:
     """Causality tests for the walk-forward loop."""
 
     def test_folds_are_sequential(self, pipeline_result: PipelineResult) -> None:
-        """Each fold's training window is valid and the test window reaches past it."""
+        """Each fold's training window is valid and ends before its test window."""
         for fold in pipeline_result.walkforward.folds:
             assert fold.train_start <= fold.train_end
-            assert fold.train_end <= fold.test_end
+            assert fold.train_end < fold.test_start
             assert fold.test_start <= fold.test_end
 
     def test_test_windows_advance(self, pipeline_result: PipelineResult) -> None:
-        """Test windows are non-overlapping in the final kept labels."""
-        previous_end: pd.Timestamp | None = None
+        """Test windows are strictly non-overlapping and advance monotonically."""
+        previous_end: dt.date | None = None
         for fold in pipeline_result.walkforward.folds:
             if previous_end is not None:
-                assert fold.test_start <= previous_end
-                assert fold.test_end >= previous_end
+                assert fold.test_start > previous_end
+                assert fold.test_end > previous_end
             previous_end = fold.test_end
+
+    def test_walkforward_labels_are_out_of_sample(self, pipeline_result: PipelineResult) -> None:
+        """Every labelled date is out-of-sample for the fold that produced it.
+
+        Each fold owns the interval (train_end, test_end]; the intervals are
+        pairwise disjoint, their union is exactly the labelled index, and every
+        labelled date sits strictly after the producing fold's training window.
+        """
+        wf = pipeline_result.walkforward
+        folds = sorted(wf.folds, key=lambda f: f.test_start)
+
+        for previous, current in pairwise(folds):
+            assert current.test_start > previous.test_end
+
+        covered: set[pd.Timestamp] = set()
+        for fold in folds:
+            assert fold.test_start > fold.train_end
+            in_fold = wf.probabilities.index[
+                (wf.probabilities.index >= pd.Timestamp(fold.test_start))
+                & (wf.probabilities.index <= pd.Timestamp(fold.test_end))
+            ]
+            dates = set(in_fold)
+            assert len(dates) == fold.n_test
+            assert not covered & dates
+            covered |= dates
+            for d in dates:
+                assert pd.Timestamp(fold.train_end) < d
+
+        assert covered == set(wf.probabilities.index)
+
+    def test_walkforward_prefix_invariance(self, test_settings: Settings) -> None:
+        """Truncating the feature matrix after T leaves the shared labels unchanged.
+
+        A label produced by a fold depends only on data at or before that date:
+        the fold's fit sees only data up to its train_end and the filter is
+        causal, so dropping later sessions must not alter earlier posteriors.
+        """
+        provider = resolve_provider(test_settings)
+        fetcher = PanelFetcher(provider, test_settings.artifacts_dir / "cache")
+        raw = fetcher.fetch(
+            test_settings.data.all_symbols,
+            test_settings.data.start,
+            test_settings.data.end,
+        )
+        panel = align_panel(raw, anchor=test_settings.data.benchmark)
+        features = build_feature_matrix(panel, test_settings)
+
+        # Pick a truncation date about two-thirds through the complete rows that
+        # is not itself a refit date of the full run.
+        full = features.dropna(how="any")
+        refit_dates = set(_refit_dates(features, test_settings))
+        position = 2 * len(full) // 3
+        while full.index[position] in refit_dates:
+            position += 1
+        truncation = full.index[position]
+
+        full_run = run_walk_forward(panel, features, test_settings, run_backtest=False)
+        trunc_run = run_walk_forward(
+            panel, features.loc[:truncation], test_settings, run_backtest=False
+        )
+
+        truncated_index = trunc_run.probabilities.index
+        common = full_run.probabilities.index.intersection(
+            truncated_index[truncated_index <= truncation]
+        )
+        assert len(common) > 0
+
+        # The shared dates must span more than one fold of the full run.
+        def owning_fold(date: pd.Timestamp) -> int:
+            for i, fold in enumerate(full_run.folds):
+                if pd.Timestamp(fold.test_start) <= date <= pd.Timestamp(fold.test_end):
+                    return i
+            msg = f"no fold covers {date}"
+            raise AssertionError(msg)
+
+        assert owning_fold(common[0]) != owning_fold(common[-1])
+
+        assert np.allclose(
+            full_run.probabilities.loc[common].to_numpy(),
+            trunc_run.probabilities.loc[common].to_numpy(),
+            atol=1e-10,
+        )
 
 
 class TestAsofPayload:
@@ -135,7 +222,8 @@ class TestAsofPayload:
         ]
     )
     def sample_asof(self, request: pytest.FixtureRequest) -> dt.date:
-        return request.param
+        param: dt.date = request.param
+        return param
 
     def test_asof_payload_uses_only_history_before_cursor(
         self, test_settings: Settings, sample_asof: dt.date
@@ -146,3 +234,48 @@ class TestAsofPayload:
         # No walk-forward backtest is produced by the as-of endpoint, but the
         # feature snapshot must be available at the requested date.
         assert payload.features is not None
+
+    def test_asof_walkforward_reproduces_walkforward_signal(
+        self, test_settings: Settings, pipeline_result: PipelineResult
+    ) -> None:
+        """The default policy returns the fold's posterior, verbatim."""
+        wf = pipeline_result.walkforward
+        index = wf.probabilities.index
+
+        dates = {
+            index[0],  # first out-of-sample date
+            pd.Timestamp(wf.folds[0].test_end),  # a refit boundary
+            index[len(index) // 3],
+            index[2 * len(index) // 3],
+            index[-1],
+        }
+
+        for d in sorted(dates):
+            payload = run_single_asof(test_settings, d.date())
+
+            expected = wf.probabilities.loc[d]
+            got = [
+                payload.probabilities.probabilities[MarketRegime(str(column))]
+                for column in expected.index
+            ]
+            assert np.allclose(got, expected.to_numpy(), atol=1e-10)
+            assert payload.regime == wf.labels[d]
+
+            fold = next(fold for fold in wf.folds if fold.test_start <= d.date() <= fold.test_end)
+            assert payload.model.train_end == fold.train_end
+
+    def test_asof_walkforward_rejects_pre_oos_dates(
+        self, test_settings: Settings, pipeline_result: PipelineResult
+    ) -> None:
+        """Dates at or before the first refit have no out-of-sample model."""
+        first_train_end = pipeline_result.walkforward.folds[0].train_end
+        with pytest.raises(InsufficientDataError):
+            run_single_asof(test_settings, first_train_end)
+
+    def test_asof_daily_refit_policy_keeps_old_behaviour(
+        self, test_settings: Settings, pipeline_result: PipelineResult
+    ) -> None:
+        """``refit_policy="daily"`` fits through the as-of date itself."""
+        asof = pipeline_result.features.index[-1].date()
+        payload = run_single_asof(test_settings, asof, refit_policy="daily")
+        assert payload.model.train_end == asof

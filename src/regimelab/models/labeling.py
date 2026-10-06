@@ -21,11 +21,13 @@ Writing ``regimes[state_index]`` is therefore always a bug.
 The fix
 -------
 Discard the model's state indices and derive an ordering from the *economic
-content* of each state: its conditional mean return and conditional volatility.
-Sort by that, then map onto the risk-ordered ladder in
-:data:`regimelab.models.types.REGIME_LADDER`. The mapping becomes a deterministic
-function of the fitted parameters, invariant to permutation, and stable across
-refits.
+content* of each state: its conditional mean return and conditional volatility,
+or -- under :attr:`~regimelab.models.types.RankingMethod.STRESS` -- the signed
+means of its emission distribution over the features with a known stress sign
+(:data:`STRESS_SIGNS`). Sort by that, then map onto the risk-ordered ladder in
+:data:`regimelab.models.types.REGIME_LADDER`. The mapping becomes a
+deterministic function of the fitted parameters, invariant to permutation, and
+stable across refits.
 
 Ties are broken by volatility and finally by the raw state index, so the ordering
 is total. Total ordering matters more than the ideal tie-break rule: a
@@ -35,44 +37,33 @@ module exists to remove.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import StrEnum
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pandas as pd
 
-from regimelab.models.types import MarketRegime, regime_ladder
+from regimelab.models.types import (
+    STRESS_SIGNS,
+    MarketRegime,
+    RankingMethod,
+    regime_ladder,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
 __all__ = [
+    "STRESS_SIGNS",
     "LabelAssignment",
     "OccupancyError",
     "RankingMethod",
     "StateStatistics",
     "assign_labels",
     "relabel_probabilities",
+    "stress_scores",
     "summarise_states",
 ]
-
-
-class RankingMethod(StrEnum):
-    """Strategy for ordering latent states from risk-on to risk-off."""
-
-    SHARPE = "sharpe"
-    """Rank by ``mean_return / volatility``. The default: it blends both
-    dimensions, so a state with modest drift and very low volatility correctly
-    ranks above one with similar drift and crisis-level volatility."""
-
-    MEAN_RETURN = "mean_return"
-    """Rank by conditional mean return alone. Cleaner to explain, but it cannot
-    distinguish a calm grind higher from a violent bear-market rally."""
-
-    VOLATILITY = "volatility"
-    """Rank by ascending conditional volatility. Appropriate when the model is
-    fitted purely on volatility features and drift is not identified."""
 
 
 class OccupancyError(ValueError):
@@ -103,6 +94,11 @@ class StateStatistics:
         Conditional standard deviation of the reference return series, annualised.
     n_observations
         Effective number of observations assigned to the state.
+    stress_score
+        Mean signed standardised emission mean over the signed stress
+        features, attached only when ranked under
+        :attr:`~regimelab.models.types.RankingMethod.STRESS`. Higher means more
+        risk-off.
     """
 
     state: int
@@ -110,6 +106,7 @@ class StateStatistics:
     mean_return: float
     volatility: float
     n_observations: int
+    stress_score: float | None = None
 
     @property
     def sharpe(self) -> float:
@@ -128,6 +125,8 @@ class StateStatistics:
             return self.sharpe
         if method is RankingMethod.MEAN_RETURN:
             return self.mean_return
+        if method is RankingMethod.STRESS:
+            return -self.stress_score if self.stress_score is not None else float("nan")
         return -self.volatility
 
 
@@ -173,6 +172,7 @@ class LabelAssignment:
                     "ann_return": stat.mean_return,
                     "ann_volatility": stat.volatility,
                     "sharpe": stat.sharpe,
+                    "stress_score": stat.stress_score,
                     "observations": stat.n_observations,
                 }
                 for stat in self.statistics
@@ -255,11 +255,64 @@ def summarise_states(
     return tuple(statistics)
 
 
+def stress_scores(
+    emission_means: np.ndarray,
+    feature_names: Sequence[str],
+    *,
+    signs: Mapping[str, int] = STRESS_SIGNS,
+) -> np.ndarray:
+    """Per-state stress score from signed standardised emission means.
+
+    Parameters
+    ----------
+    emission_means
+        ``(n_states, n_features)`` matrix of per-state emission means in
+        standardised feature space, columns ordered as ``feature_names``.
+    feature_names
+        Feature name for each column of ``emission_means``.
+    signs
+        Stress sign per feature name: ``+1`` means a higher standardised
+        emission mean indicates more stress, ``-1`` the opposite. Defaults to
+        :data:`STRESS_SIGNS`; a custom mapping replaces it entirely and is
+        never merged.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_states,)`` mean of ``sign * mean`` over the features that carry a
+        stress sign in ``signs``. Higher means more risk-off.
+
+    Raises
+    ------
+    ValueError
+        If ``emission_means`` does not have one column per feature name, or if
+        none of the features carries a stress sign.
+    """
+    names = [str(name) for name in feature_names]
+    means = np.asarray(emission_means, dtype="float64")
+    if means.ndim != 2 or means.shape[1] != len(names):
+        msg = f"emission_means with shape {means.shape} does not match {len(names)} feature names"
+        raise ValueError(msg)
+
+    signed = [(i, signs[name]) for i, name in enumerate(names) if name in signs]
+    if not signed:
+        valid = ", ".join(sorted(signs))
+        msg = f"no signed stress features among {names}; valid keys: {valid}"
+        raise ValueError(msg)
+
+    columns = np.array([i for i, _ in signed])
+    sign_values = np.array([sign for _, sign in signed], dtype="float64")
+    return cast(np.ndarray, (means[:, columns] * sign_values).mean(axis=1))
+
+
 def assign_labels(
     statistics: Sequence[StateStatistics],
     *,
     method: RankingMethod = RankingMethod.SHARPE,
     min_occupancy: float = 0.0,
+    emission_means: np.ndarray | None = None,
+    feature_names: Sequence[str] | None = None,
+    signs: Mapping[str, int] = STRESS_SIGNS,
 ) -> LabelAssignment:
     """Map raw states onto the canonical regime ladder.
 
@@ -271,6 +324,17 @@ def assign_labels(
         Ranking strategy.
     min_occupancy
         Reject the fit if any state's occupancy falls below this share.
+    emission_means
+        ``(n_states, n_features)`` standardised emission means, required when
+        ``method`` is :attr:`~regimelab.models.types.RankingMethod.STRESS`.
+        Row ``s`` must correspond to raw state ``s``.
+    feature_names
+        Feature name for each column of ``emission_means``; required together
+        with ``emission_means`` under STRESS.
+    signs
+        Stress sign per feature name, forwarded to :func:`stress_scores` under
+        STRESS. Defaults to :data:`STRESS_SIGNS` and is ignored by the other
+        methods.
 
     Returns
     -------
@@ -282,7 +346,9 @@ def assign_labels(
     OccupancyError
         If a state is below ``min_occupancy``.
     ValueError
-        If the state count has no defined ladder.
+        If the state count has no defined ladder, if STRESS ranking is missing
+        its emission inputs, or if a state index is out of range for
+        ``emission_means``.
     """
     if not statistics:
         msg = "cannot assign labels without state statistics"
@@ -299,6 +365,24 @@ def assign_labels(
             "lengthen the training window, or relax min_state_occupancy"
         )
         raise OccupancyError(msg)
+
+    if method is RankingMethod.STRESS:
+        if emission_means is None or feature_names is None:
+            msg = (
+                "STRESS ranking requires both emission_means and feature_names: "
+                "the score is computed from standardised emission means"
+            )
+            raise ValueError(msg)
+        scores = stress_scores(emission_means, feature_names, signs=signs)
+        if any(not 0 <= stat.state < scores.shape[0] for stat in statistics):
+            msg = (
+                f"state index out of range for {scores.shape[0]} emission rows: "
+                f"{[stat.state for stat in statistics]}"
+            )
+            raise ValueError(msg)
+        statistics = tuple(
+            replace(stat, stress_score=float(scores[stat.state])) for stat in statistics
+        )
 
     # Total ordering: score descending, then volatility ascending, then raw index.
     # The final key guarantees determinism even for exactly-tied states.
@@ -319,9 +403,12 @@ def assign_labels(
     # BULL_TREND for 2-state models).  When several positive states compete for
     # the same non-bear label, the later duplicates are resolved by
     # :func:`relabel_probabilities`, which aggregates raw-state probabilities per
-    # canonical regime.
+    # canonical regime.  The guardrail does not apply under STRESS, where the
+    # signed stress score is the sole ordering criterion.
     non_bear_labels = [
-        label for label in ladder if label not in (MarketRegime.HIGH_VOL_BEAR, MarketRegime.RISK_OFF)
+        label
+        for label in ladder
+        if label not in (MarketRegime.HIGH_VOL_BEAR, MarketRegime.RISK_OFF)
     ]
     cap_label = non_bear_labels[-1] if non_bear_labels else ladder[0]
 
@@ -329,7 +416,8 @@ def assign_labels(
     for rank, stat in enumerate(ordered):
         label = ladder[rank]
         if (
-            label in (MarketRegime.HIGH_VOL_BEAR, MarketRegime.RISK_OFF)
+            method is not RankingMethod.STRESS
+            and label in (MarketRegime.HIGH_VOL_BEAR, MarketRegime.RISK_OFF)
             and np.isfinite(stat.mean_return)
             and stat.mean_return >= 0.0
         ):

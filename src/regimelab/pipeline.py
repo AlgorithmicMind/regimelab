@@ -19,17 +19,24 @@ must fit inside a :class:`~regimelab.models.types.TelemetryPayload`.
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
+import numpy as np
 import pandas as pd
 
-from regimelab.backtest.walkforward import WalkForwardResult, run_walk_forward
+from regimelab.backtest.walkforward import (
+    WalkForwardResult,
+    filter_frozen,
+    oos_train_end,
+    run_walk_forward,
+)
 from regimelab.data.alignment import align_panel
 from regimelab.data.fetcher import PanelFetcher
 from regimelab.data.providers import resolve_provider
 from regimelab.features import build_feature_matrix, snapshot_at
+from regimelab.models.base import InsufficientDataError, probabilities_from_row
 from regimelab.models.registry import build_classifier
 from regimelab.models.types import AllocationWeights, TelemetryPayload
 from regimelab.store import RunManifest, RunStore, digest_frame
@@ -98,6 +105,60 @@ def _fit_single_model(
     """Fit the classifier on the full available history."""
     model = build_classifier(settings.model)
     return model.fit(features, returns, train_end=train_end)
+
+
+def _data_quality_warnings(
+    *,
+    asof: dt.date,
+    session_date: dt.date,
+    observation_date: dt.date,
+    features: pd.DataFrame,
+    feature_names: Sequence[str],
+    panel: AlignedPanel,
+) -> tuple[str, ...]:
+    """Describe, never repair, the gap between the request and the data.
+
+    Degradations are reported in a fixed order: a requested date that is not
+    a trading session, a posterior computed on an older session, model
+    features unavailable at the as-of date, inputs carried forward by the
+    staleness budget, and symbols dropped for having no usable history at all.
+    """
+    warnings: list[str] = []
+
+    if session_date < asof:
+        message = (
+            f"non_session_asof: requested asof {asof.isoformat()} is not a "
+            f"trading session; last session {session_date.isoformat()}"
+        )
+        warnings.append(message)
+
+    if observation_date < session_date:
+        message = (
+            f"stale_observation: regime computed on {observation_date.isoformat()}, "
+            f"last session {session_date.isoformat()}"
+        )
+        warnings.append(message)
+
+    session = features.loc[: pd.Timestamp(asof)]
+    row = session.iloc[-1] if not session.empty else None
+    warnings.extend(
+        f"missing_feature: {name} unavailable at asof"
+        for name in feature_names
+        if name not in features.columns or row is None or pd.isna(row[name])
+    )
+
+    staleness = panel.staleness.loc[: pd.Timestamp(asof)]
+    if not staleness.empty:
+        latest = staleness.iloc[-1]
+        for symbol in sorted(str(s) for s in latest.index):
+            value = latest[symbol]
+            if np.isfinite(value) and value > 0:
+                warnings.append(
+                    f"stale_input: {symbol} last observed {int(value)} sessions earlier"
+                )
+
+    warnings.extend(f"dropped_symbol: {symbol}" for symbol in panel.dropped_symbols)
+    return tuple(warnings)
 
 
 def run_pipeline(
@@ -172,16 +233,23 @@ def run_pipeline(
 
 
 def latest_telemetry(result: PipelineResult) -> TelemetryPayload:
-    """Build the telemetry payload for the last observable date.
+    """Build the telemetry payload for the last master-calendar session.
 
     The payload is the canonical boundary object rendered by the TUI and HTML
     report. It contains the modal regime, the full posterior, the feature
     snapshot and the target allocation at the final as-of date.
+
+    When the newest sessions are not filterable -- inputs past their staleness
+    budget, say -- the payload reports the gap in ``session_date``,
+    ``observation_date`` and ``warnings`` rather than filling it. Whether a
+    stale read is publishable is the consumer's decision, not the engine's.
     """
-    asof = result.walkforward.labels.index[-1]
+    # ``asof`` is already the last master-calendar session, so it is also the
+    # session the payload reports against.
+    asof = result.features.index[-1]
     features = result.features
     snapshot = snapshot_at(features, asof)
-    probabilities = result.walkforward.regime_probabilities(asof)
+    probabilities, observed = result.walkforward.posterior_at(asof)
     regime = probabilities.argmax
 
     target_weights: AllocationWeights | None = None
@@ -195,11 +263,21 @@ def latest_telemetry(result: PipelineResult) -> TelemetryPayload:
 
     return TelemetryPayload(
         asof=asof.date(),
+        session_date=asof.date(),
+        observation_date=observed.date(),
         regime=regime,
         probabilities=probabilities,
         features=snapshot,
         model=metadata,
         target_weights=target_weights,
+        warnings=_data_quality_warnings(
+            asof=asof.date(),
+            session_date=asof.date(),
+            observation_date=observed.date(),
+            features=features,
+            feature_names=metadata.feature_names or result.settings.model.features,
+            panel=result.panel,
+        ),
     )
 
 
@@ -227,28 +305,70 @@ def run_single_asof(
     *,
     command: str = "asof",
     fitted: FittedRegime | None = None,
+    refit_policy: Literal["walkforward", "daily"] = "walkforward",
 ) -> TelemetryPayload:
     """Produce a telemetry payload for a specific historical as-of date.
 
-    The model is fit through ``asof`` and the filter is run up to ``asof``,
-    then the payload is built. This is the function used by the ``asof`` CLI
-    command and by the research notebook examples.
+    With the default ``refit_policy="walkforward"`` the payload reproduces the
+    walk-forward signal exactly: the model that owns ``asof``'s last usable
+    observation is the one trained at the last scheduled refit *strictly
+    before* it, and the filter runs with frozen parameters from the stationary
+    distribution. ``refit_policy="daily"`` keeps the previous behaviour of
+    fitting through ``asof`` itself. This is the function used by the ``asof``
+    CLI command and by the research notebook examples.
 
-    If ``fitted`` is provided, the model is *not* retrained.  Instead the
-    supplied :class:`~regimelab.models.base.FittedRegime` is filtered causally
-    through ``asof`` using its frozen parameters and standardiser.
+    When the sessions closest to ``asof`` are not filterable -- or ``asof``
+    itself is not a trading session -- the payload reports the gap in
+    ``session_date``, ``observation_date`` and ``warnings`` rather than
+    filling it; publishing a stale read is the consumer's decision.
+
+    If ``fitted`` is provided, the model is *not* retrained and the refit
+    policy does not apply.  Instead the supplied
+    :class:`~regimelab.models.base.FittedRegime` is filtered causally through
+    ``asof`` using its frozen parameters and standardiser.
     """
     panel = _fetch_and_align(settings)
     features = build_feature_matrix(panel, settings)
     returns = panel.log_returns([settings.data.benchmark])[settings.data.benchmark]
 
-    if fitted is None:
-        fit = _fit_single_model(features, returns, settings, train_end=pd.Timestamp(asof))
-    else:
+    if fitted is not None:
         fit = fitted
-    probabilities = fit.probabilities_at(features, asof)
+        probabilities, observed = fit.posterior_at(features, asof)
+    elif refit_policy == "daily":
+        fit = _fit_single_model(features, returns, settings, train_end=pd.Timestamp(asof))
+        probabilities, observed = fit.posterior_at(features, asof)
+    else:
+        # The observation date anchors the fold lookup: when asof's own row
+        # is incomplete, a model trained "strictly before asof" could be
+        # trained on `observed` itself -- the walk-forward fold that labels
+        # `observed` is the one trained strictly before `observed`.
+        usable = features.loc[: pd.Timestamp(asof), list(settings.model.features)].dropna(how="any")
+        if usable.empty:
+            msg = f"no complete feature row at or before {asof}"
+            raise InsufficientDataError(msg)
+        observed = usable.index[-1]
+
+        train_end = oos_train_end(features.loc[: pd.Timestamp(asof)], settings, observed)
+        fit = build_classifier(settings.model).fit(features, returns, train_end=train_end)
+
+        hist = filter_frozen(fit, features, pd.Timestamp(asof))
+        if hist.empty:
+            msg = f"no filterable observation at or before {asof}"
+            raise InsufficientDataError(msg)
+        probabilities = probabilities_from_row(hist.iloc[-1])
+        if hist.index[-1] != observed:
+            msg = (
+                f"walk-forward filter observed {hist.index[-1].date()} for asof "
+                f"{asof}, expected {observed.date()}"
+            )
+            raise RuntimeError(msg)
+
     regime = probabilities.argmax
     snapshot = snapshot_at(features, asof)
+    # ``features`` is indexed on the master calendar; the last session at or
+    # before ``asof`` exists because the posterior and snapshot already raised
+    # otherwise.
+    session_date = features.index[features.index <= pd.Timestamp(asof)][-1].date()
 
     target_weights: AllocationWeights | None = None
     if regime in settings.backtest.regime_weights:
@@ -266,9 +386,19 @@ def run_single_asof(
 
     return TelemetryPayload(
         asof=asof,
+        session_date=session_date,
+        observation_date=observed.date(),
         regime=regime,
         probabilities=probabilities,
         features=snapshot,
         model=fit.metadata,
         target_weights=target_weights,
+        warnings=_data_quality_warnings(
+            asof=asof,
+            session_date=session_date,
+            observation_date=observed.date(),
+            features=features,
+            feature_names=fit.standardiser.columns,
+            panel=panel,
+        ),
     )
