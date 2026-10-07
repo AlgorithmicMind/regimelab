@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0
+## 0.2.0 — 2026-10-07
 
 - Official CBOE/FRED sourcing for ^VIX and ^VIX3M with provider fallback
 - Breaking: HMM and Hamilton models rank states by stress features; positive-drift guardrail no longer applies under STRESS

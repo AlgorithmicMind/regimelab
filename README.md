@@ -30,7 +30,7 @@ Most open-source regime detection scripts fit a Hidden Markov Model (HMM) on the
 
 | Challenge | Raw `hmmlearn` / `statsmodels` | RegimeLab Framework |
 | :--- | :--- | :--- |
-| **State Labeling** | Unordered integer states (permutes on refit) | **Deterministic Canonical Sorting** ($\frac{\mu}{\sigma}$ / conditional vol ordering) |
+| **State Labeling** | Unordered integer states (permutes on refit) | **Deterministic Canonical Sorting** — stress score over emission means by default for HMM/Hamilton (configurable via `ranking_method` / `stress_signs`); Sharpe and volatility ordering still available |
 | **Temporal Clock** | In-sample full-sample fitting (Look-ahead) | **Strict Point-in-Time (`asof`) cursor** & expanding-window walk-forward |
 | **Systemic Risk** | None | **Kritzman Absorption Ratio (PCA)**, VIX Term Spread & Sector Breadth |
 | **Execution Reality** | Pure theoretical classification | **Walk-Forward Backtester** with transaction costs (bps) and confidence floors |
@@ -38,6 +38,17 @@ Most open-source regime detection scripts fit a Hidden Markov Model (HMM) on the
 | **Reporting** | Matplotlib static plot | **Interactive Plotly HTML reports** + Textual TUI Terminal Dashboard |
 
 ---
+
+## 🆕 What's new in 0.2.0
+
+- **Causal walk-forward**: each fold labels only its own interval `(r_k, r_{k+1}]` with a model trained through `r_k` — no look-ahead, no overlapping labels.
+- **Stress labelling**: `RankingMethod.STRESS` (default for HMM/Hamilton) orders states by signed emission means; the positive-drift guardrail no longer applies.
+- **Official volatility sources**: `^VIX`/`^VIX3M` read from CBOE, then FRED, with the configured provider as fallback (`volatility_source`).
+- **Data-quality telemetry**: `TelemetryPayload` reports `session_date`, `observation_date`, `is_stale` and explicit `warnings` for stale or missing inputs.
+- **Signal vs. investable universes**: `DataSettings.correlation_assets` decouples the correlation features from `risk_assets`, which now only drives the backtest.
+- **Live signal = backtest signal**: `run_single_asof` defaults to `refit_policy="walkforward"`, reproducing the walk-forward posterior for the requested date.
+
+See the [CHANGELOG](CHANGELOG.md) for the full list.
 
 ## 🚀 Quickstart
 
@@ -59,13 +70,23 @@ pip install "regimelab[tui]"
 from regimelab import Settings
 from regimelab.pipeline import run_single_asof
 
-# Run point-in-time regime inference for any historical or current date
+# Run point-in-time regime inference for any historical or current date.
+# refit_policy="walkforward" (the default) reproduces the exact posterior the
+# walk-forward backtest produced for that date — the live signal is the
+# track record. Pass refit_policy="daily" to refit through the as-of date.
 settings = Settings(data={"provider": "yfinance"})
 payload = run_single_asof(settings, asof="2024-12-31")
 
 print(f"Detected Regime: {payload.regime.value}")
 print(f"Confidence: {payload.probabilities.confidence:.2%}")
 print(f"Target Allocation: {payload.target_weights.weights if payload.target_weights else {}}")
+
+# Data quality is explicit: is_stale is True when the posterior was computed
+# on an earlier session, and warnings explain why.
+print(f"Computed on: {payload.observation_date} (last session {payload.session_date})")
+print(f"Stale: {payload.is_stale}")
+for warning in payload.warnings:
+    print(f"  warning: {warning}")
 ```
 
 #### Extract Causal Systemic Risk Features
@@ -147,7 +168,7 @@ Additional CLI commands include `regimelab report OUTPUT` for direct HTML genera
 
 ### 1. Canonical State Labeling (`regimelab.models.labeling`)
 
-To eliminate label switching, RegimeLab fits the underlying statistical model (Gaussian HMM, Hamilton Markov Switching, or GMM) and evaluates the conditional distribution parameters of each state. States are sorted by risk-adjusted return ($\frac{\mu}{\sigma}$) and mapped deterministically to:
+To eliminate label switching, RegimeLab fits the underlying statistical model (Gaussian HMM, Hamilton Markov Switching, or GMM) and evaluates the conditional distribution parameters of each state. HMM and Hamilton sort states by a **stress score** — the mean signed standardised emission mean over features with a known stress sign (`stress_signs` makes the sign table configurable) — while the GMM control orders by conditional volatility. Sharpe ($\frac{\mu}{\sigma}$) ordering remains available via `ranking_method`. States are then mapped deterministically to:
 
 - **BULL_TREND** (High return, low volatility)
 - **NEUTRAL_TRANSITION** (Moderate return, mean-reverting)
