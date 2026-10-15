@@ -13,11 +13,13 @@ from regimelab.data.providers import resolve_provider
 from regimelab.features import build_feature_matrix
 from regimelab.models.labeling import (
     STRESS_SIGNS,
+    LabelAssignment,
     RankingMethod,
     StateStatistics,
     assign_labels,
     relabel_probabilities,
     stress_scores,
+    summarise_states,
 )
 from regimelab.models.registry import CLASSIFIERS, build_classifier
 from regimelab.models.types import (
@@ -347,7 +349,7 @@ def test_describe_reports_stress_score() -> None:
 
 
 def test_to_statistics_is_ladder_ordered() -> None:
-    """``to_statistics()`` returns one entry per state, sorted by risk_rank."""
+    """``to_statistics()`` returns one entry per regime, sorted by risk_rank."""
     feature_names = ("trailing_return", "realised_vol", "vix_term_spread")
     emission_means = np.array(
         [
@@ -373,8 +375,9 @@ def test_to_statistics_is_ladder_ordered() -> None:
     # Mapping is bijective, so every ladder regime appears exactly once, in
     # ladder order -- not in raw-state order (calm=0, transition=2, crisis=1).
     assert [entry.regime for entry in entries] == list(regime_ladder(3))
-    assert [entry.raw_state for entry in entries] == [0, 2, 1]
+    assert [entry.raw_states for entry in entries] == [(0,), (2,), (1,)]
 
+    # A single-state regime reproduces the state's values exactly.
     crisis = entries[-1]
     assert crisis.regime == MarketRegime.RISK_OFF
     assert crisis.occupancy == pytest.approx(0.2)
@@ -383,7 +386,8 @@ def test_to_statistics_is_ladder_ordered() -> None:
     assert crisis.n_observations == 100
     assert crisis.stress_score is not None
 
-    # describe() is built from to_statistics(): same rows, documented columns.
+    # describe() keeps one row per raw state, sorted by ladder position then
+    # raw index -- same order as to_statistics() when the mapping is bijective.
     frame = assignment.describe()
     assert list(frame.columns) == [
         "regime",
@@ -397,6 +401,133 @@ def test_to_statistics_is_ladder_ordered() -> None:
     ]
     assert list(frame["regime"]) == [r.value for r in regime_ladder(3)]
     assert list(frame["raw_state"]) == [0, 2, 1]
+
+
+def test_to_statistics_combines_states_sharing_a_regime() -> None:
+    """States the guardrail maps to one regime fold into a single entry."""
+    stats = (
+        StateStatistics(
+            state=0, occupancy=0.4, mean_return=0.15, volatility=0.10, n_observations=400
+        ),
+        StateStatistics(
+            state=1, occupancy=0.3, mean_return=0.05, volatility=0.20, n_observations=300
+        ),
+        StateStatistics(
+            state=2, occupancy=0.3, mean_return=0.02, volatility=0.30, n_observations=300
+        ),
+    )
+    assignment = assign_labels(stats, method=RankingMethod.VOLATILITY)
+    # Premise: the positive-drift guardrail caps state 2 at NEUTRAL_TRANSITION.
+    assert assignment.mapping == {
+        0: MarketRegime.BULL_TREND,
+        1: MarketRegime.NEUTRAL_TRANSITION,
+        2: MarketRegime.NEUTRAL_TRANSITION,
+    }
+
+    entries = assignment.to_statistics()
+    assert len(entries) == 2
+
+    neutral = entries[1]
+    assert neutral.regime == MarketRegime.NEUTRAL_TRANSITION
+    assert neutral.raw_states == (1, 2)
+    assert neutral.occupancy == pytest.approx(0.6)
+    assert neutral.n_observations == 600
+
+    # describe() still reports every raw state, in (ladder, state) order.
+    frame = assignment.describe()
+    assert len(frame) == 3
+    assert list(frame["raw_state"]) == [0, 1, 2]
+    assert list(frame["regime"]) == [
+        MarketRegime.BULL_TREND.value,
+        MarketRegime.NEUTRAL_TRANSITION.value,
+        MarketRegime.NEUTRAL_TRANSITION.value,
+    ]
+
+
+def test_to_statistics_combination_matches_summed_posterior() -> None:
+    """Combining two states equals summarising their summed posterior column."""
+    rng = np.random.default_rng(7)
+    n_obs = 2000
+    returns = pd.Series(rng.normal(0.0003, 0.012, n_obs))
+    posteriors = pd.DataFrame(
+        rng.dirichlet([2.0, 5.0, 3.0], size=n_obs),
+        columns=[0, 1, 2],
+    )
+
+    statistics = summarise_states(returns, posteriors)
+    assignment = LabelAssignment(
+        mapping={
+            0: MarketRegime.BULL_TREND,
+            1: MarketRegime.NEUTRAL_TRANSITION,
+            2: MarketRegime.NEUTRAL_TRANSITION,
+        },
+        statistics=statistics,
+        method=RankingMethod.VOLATILITY,
+    )
+    combined = next(
+        entry
+        for entry in assignment.to_statistics()
+        if entry.regime == MarketRegime.NEUTRAL_TRANSITION
+    )
+
+    merged = pd.DataFrame({0: posteriors[0], 1: posteriors[1] + posteriors[2]})
+    merged_stats = {stat.state: stat for stat in summarise_states(returns, merged)}
+
+    assert combined.raw_states == (1, 2)
+    assert combined.ann_return == pytest.approx(merged_stats[1].mean_return, abs=1e-12)
+    assert combined.ann_volatility == pytest.approx(merged_stats[1].volatility, abs=1e-12)
+
+
+def test_to_statistics_zero_weight_states() -> None:
+    """A zero-weight state contributes its index but no moments."""
+    weighted = StateStatistics(
+        state=0,
+        occupancy=0.7,
+        mean_return=0.10,
+        volatility=0.15,
+        n_observations=500,
+        stress_score=1.5,
+    )
+    empty = StateStatistics(
+        state=1,
+        occupancy=0.0,
+        mean_return=float("nan"),
+        volatility=float("nan"),
+        n_observations=0,
+        stress_score=0.5,
+    )
+
+    alone = LabelAssignment(
+        mapping={0: MarketRegime.BULL_TREND, 1: MarketRegime.NEUTRAL_TRANSITION},
+        statistics=(weighted, empty),
+        method=RankingMethod.VOLATILITY,
+    )
+    neutral = next(
+        entry for entry in alone.to_statistics() if entry.regime == MarketRegime.NEUTRAL_TRANSITION
+    )
+    assert neutral.raw_states == (1,)
+    assert neutral.occupancy == 0.0
+    assert neutral.ann_return is None
+    assert neutral.ann_volatility is None
+    assert neutral.sharpe is None
+    assert neutral.n_observations == 0
+    # No weighted member: the plain mean of the group's scores.
+    assert neutral.stress_score == pytest.approx(0.5)
+
+    combined = LabelAssignment(
+        mapping={0: MarketRegime.NEUTRAL_TRANSITION, 1: MarketRegime.NEUTRAL_TRANSITION},
+        statistics=(weighted, empty),
+        method=RankingMethod.VOLATILITY,
+    )
+    (entry,) = combined.to_statistics()
+    assert entry.raw_states == (0, 1)
+    assert entry.occupancy == pytest.approx(0.7)
+    assert entry.ann_return == pytest.approx(weighted.mean_return)
+    assert entry.ann_volatility == pytest.approx(weighted.volatility)
+    assert entry.sharpe == pytest.approx(weighted.sharpe)
+    # The weighted mean runs over weighted members only.
+    assert entry.stress_score == pytest.approx(1.5)
+    assert entry.n_observations == 500
 
 
 @pytest.fixture(scope="module")

@@ -2,8 +2,8 @@
 
 ## 0.3.0 — 2026-10-20
 
-- `RegimeStatistics`: `LabelAssignment.to_statistics()` exposes per-regime training-window statistics; `TelemetryPayload.state_statistics` carries them and `statistics_for(regime)` looks them up by regime
-- `LabelAssignment.describe()` rows are now in ladder order (risk-on to risk-off), not raw-state order
+- `RegimeStatistics`: `LabelAssignment.to_statistics()` exposes per-regime training-window statistics — one entry per regime, so states sharing a regime (the positive-drift guardrail under VOLATILITY/SHARPE) are combined with occupancy-weighted moments, mirroring how `relabel_probabilities` sums their posteriors; `raw_states: tuple[int, ...]` lists every member state, and `ann_return`/`ann_volatility`/`sharpe` are `None` for a regime without weight. `TelemetryPayload.state_statistics` carries them and `statistics_for(regime)` looks them up by regime
+- `LabelAssignment.describe()` keeps one row per raw state (as in 0.2.0), sorted by ladder position
 - `WalkForwardFold.statistics` holds the fold model's per-regime statistics
 - `latest_telemetry` signs the payload with the model and statistics of the fold whose `[test_start, test_end]` contains `observation_date`, instead of always the last fold
 - `simulate_weights` simulates any hand-supplied target-weight schedule under the same execution assumptions; `run_backtest` is reimplemented on it with numerically identical output (golden regression test)

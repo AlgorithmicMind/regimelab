@@ -283,7 +283,7 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
   - Method: `normalise(symbols=None) -> dict[str, float]`
 - `ModelMetadata`:
   - Fields: `name`, `n_states`, `seed`, `train_start`, `train_end`, `n_train_observations`, `converged`, `log_likelihood`, `feature_names`
-- `RegimeStatistics` (frozen Pydantic): `regime: MarketRegime`, `raw_state: int (>=0)`, `occupancy: float [0,1]`, `ann_return: float`, `ann_volatility: float (>=0)`, `sharpe: float`, `stress_score: float | None`, `n_observations: int (>=0)` — per-regime statistics of the training window of the model that produced them.
+- `RegimeStatistics` (frozen Pydantic): `regime: MarketRegime`, `raw_states: tuple[int, ...]` (non-empty, sorted, unique, all `>=0`), `occupancy: float [0,1]`, `ann_return: float | None`, `ann_volatility: float | None (>=0)`, `sharpe: float | None`, `stress_score: float | None`, `n_observations: int (>=0)` — per-regime statistics of the training window of the model that produced them. `ann_return`/`ann_volatility`/`sharpe` are `None` when no member state carries weight.
 - `TelemetryPayload`:
   - Fields: `asof`, `session_date`, `observation_date`, `regime`, `probabilities`, `features`, `model`, `state_statistics`, `target_weights`, `warnings`
   - `state_statistics: tuple[RegimeStatistics, ...]` — describes the *training window* of the model signing the payload (`model.train_start..train_end`), not the live filtering window.
@@ -339,8 +339,8 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 - `OccupancyError(ValueError)`
 - `StateStatistics` (dataclass): `state`, `occupancy`, `mean_return`, `volatility`, `n_observations`, `stress_score`; property `sharpe`
 - `LabelAssignment` (dataclass): `mapping`, `statistics`, `method`; property `inverse`; methods `regime_of(state)`, `to_statistics() -> tuple[RegimeStatistics, ...]`, `describe() -> pd.DataFrame`
-  - `to_statistics` returns one `RegimeStatistics` per fitted state, ordered by the regime's ladder position (`risk_rank`).
-  - `describe()` is built from `to_statistics()` — same columns as before (`regime`, `raw_state`, `occupancy`, `ann_return`, `ann_volatility`, `sharpe`, `stress_score`, `observations`), rows now in ladder order rather than raw-state order.
+  - `to_statistics` returns one `RegimeStatistics` per regime that appears in the mapping, ordered by the regime's ladder position (`risk_rank`). States sharing a regime — the positive-drift guardrail can do that under VOLATILITY/SHARPE — are combined with occupancy-weighted moments (the same aggregation `relabel_probabilities` applies to their posteriors); `raw_states` lists every member state, and a regime without weight gets `None` moments.
+  - `describe()` keeps one row per raw state (columns `regime`, `raw_state`, `occupancy`, `ann_return`, `ann_volatility`, `sharpe`, `stress_score`, `observations`), sorted by regime ladder position then raw state; zero-weight states keep their NaN moments.
 - `summarise_states(reference_returns, posteriors, *, trading_days=252) -> tuple[StateStatistics, ...]`
 - `stress_scores(emission_means, feature_names, *, signs=STRESS_SIGNS) -> np.ndarray` — mean signed standardised emission mean per state over the `signs` features
 - `assign_labels(statistics, *, method=SHARPE, min_occupancy=0.0, emission_means=None, feature_names=None, signs=STRESS_SIGNS) -> LabelAssignment` — `emission_means`/`feature_names` required under `STRESS`, `signs` forwarded to `stress_scores`; the positive-drift guardrail does not apply under `STRESS`
@@ -727,7 +727,7 @@ Parametrized for three dates: `2020-03-16`, `2020-06-15`, `2020-12-31`. Counts a
 - SHARPE/MEAN_RETURN/VOLATILITY behaviours, including the drift guardrail and aggregate-duplicate relabelling.
 - `ModelSettings.ranking_method` overrides the classifier default.
 - `ModelSettings.stress_signs` replaces `STRESS_SIGNS` entirely: custom signs change the fitted assignment, coverage is validated only when STRESS is in effect, and each registry classifier's `ranking_method` ClassVar equals `DEFAULT_RANKING_METHODS[name]`.
-- `LabelAssignment.to_statistics()` returns `RegimeStatistics` in ladder order; `describe()` exposes the same columns in that order.
+- `LabelAssignment.to_statistics()` returns one `RegimeStatistics` per regime in ladder order: states sharing a regime (guardrail under VOLATILITY/SHARPE) combine with occupancy-weighted moments identical to summarising their summed posterior column; zero-weight states contribute their `raw_states` index but `None` moments; `describe()` keeps one row per raw state.
 
 ### 4.6 `tests/test_labeling_synthetic.py`
 
@@ -766,8 +766,9 @@ Parametrized for three dates: `2020-03-16`, `2020-06-15`, `2020-12-31`. Counts a
 - `TelemetryPayload` validators enforce `observation_date <= session_date <= asof`; `is_stale` compares the observation to the session, not the calendar.
 - Data gaps produce, in order, `non_session_asof`, `stale_observation`, `missing_feature`, `stale_input`, `dropped_symbol` warnings; clean sessions produce none.
 - `state_statistics` rejects duplicate regimes; `statistics_for(regime)` resolves by regime (`KeyError` when uncovered); payloads from `run_single_asof` and `latest_telemetry` carry the owning fold's statistics.
+- A duplicate-regime mapping (guardrail) still produces a valid payload; a `gmm` (VOLATILITY) pipeline run carries unique, ladder-ordered statistics.
 
-**Total: 84 collected test cases** (the parametrized as-of fixture counts as 3).
+**Total: 89 collected test cases** (the parametrized as-of fixture counts as 3).
 
 ---
 

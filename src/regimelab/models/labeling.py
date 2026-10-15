@@ -66,6 +66,19 @@ __all__ = [
     "summarise_states",
 ]
 
+_TRADING_DAYS = 252
+"""Sessions per year used to convert between daily and annualised moments."""
+
+
+def _sharpe(mean_return: float, volatility: float) -> float:
+    """Return-to-risk ratio; ``0.0`` for a degenerate zero-volatility input.
+
+    The ``0.0`` keeps sorts well-defined instead of producing ``inf``.
+    """
+    if not np.isfinite(volatility) or volatility <= 0.0:
+        return 0.0
+    return mean_return / volatility
+
 
 class OccupancyError(ValueError):
     """Raised when a fitted state captures too little of the sample.
@@ -116,9 +129,7 @@ class StateStatistics:
         Returns ``0.0`` for a degenerate zero-volatility state instead of
         ``inf``, so the sort stays well-defined.
         """
-        if not np.isfinite(self.volatility) or self.volatility <= 0.0:
-            return 0.0
-        return self.mean_return / self.volatility
+        return _sharpe(self.mean_return, self.volatility)
 
     def score(self, method: RankingMethod) -> float:
         """Risk-on score under ``method``. Higher means more risk-on."""
@@ -165,53 +176,113 @@ class LabelAssignment:
     def to_statistics(self) -> tuple[RegimeStatistics, ...]:
         """Per-regime training-window statistics, ordered by the risk ladder.
 
-        One entry per fitted state, carrying the regime it was mapped to. The
-        ordering key is the regime's position on the canonical ladder, so the
-        result reads risk-on to risk-off regardless of raw state order.
+        One entry per regime that appears in the mapping. The positive-drift
+        guardrail can map several raw states to the same regime under
+        VOLATILITY or SHARPE; those states are combined into a single entry
+        with occupancy-weighted moments, mirroring how
+        :func:`relabel_probabilities` sums their posteriors. ``raw_states``
+        lists every member state, including zero-weight ones, for
+        traceability.
         """
+        groups: dict[MarketRegime, list[StateStatistics]] = {}
+        for stat in self.statistics:
+            groups.setdefault(self.mapping[stat.state], []).append(stat)
         entries = [
-            RegimeStatistics(
-                regime=self.mapping[stat.state],
-                raw_state=stat.state,
-                occupancy=stat.occupancy,
-                ann_return=stat.mean_return,
-                ann_volatility=stat.volatility,
-                sharpe=stat.sharpe,
-                stress_score=stat.stress_score,
-                n_observations=stat.n_observations,
-            )
-            for stat in self.statistics
+            _combine_regime_statistics(regime, members) for regime, members in groups.items()
         ]
         return tuple(sorted(entries, key=lambda entry: entry.regime.risk_rank))
 
     def describe(self) -> pd.DataFrame:
         """Tabular summary for reports and the dashboard.
 
-        Rows are in ladder order (risk-on to risk-off), matching
-        :meth:`to_statistics`.
+        One row per raw state, sorted by the regime's ladder position and
+        then raw state index. Zero-weight states keep their NaN moments.
         """
+        rows = sorted(
+            self.statistics,
+            key=lambda stat: (self.mapping[stat.state].risk_rank, stat.state),
+        )
         return pd.DataFrame(
             [
                 {
-                    "regime": entry.regime.value,
-                    "raw_state": entry.raw_state,
-                    "occupancy": entry.occupancy,
-                    "ann_return": entry.ann_return,
-                    "ann_volatility": entry.ann_volatility,
-                    "sharpe": entry.sharpe,
-                    "stress_score": entry.stress_score,
-                    "observations": entry.n_observations,
+                    "regime": self.mapping[stat.state].value,
+                    "raw_state": stat.state,
+                    "occupancy": stat.occupancy,
+                    "ann_return": stat.mean_return,
+                    "ann_volatility": stat.volatility,
+                    "sharpe": stat.sharpe,
+                    "stress_score": stat.stress_score,
+                    "observations": stat.n_observations,
                 }
-                for entry in self.to_statistics()
+                for stat in rows
             ],
         )
+
+
+def _combine_regime_statistics(
+    regime: MarketRegime,
+    members: Sequence[StateStatistics],
+) -> RegimeStatistics:
+    """Combine the raw states mapped to one ``regime`` into a single entry.
+
+    *Weighted members* -- states with positive occupancy and finite moments --
+    drive the combined moments with occupancy weights, so the result equals
+    the moments a posterior column summing the member columns would produce
+    (the same aggregation :func:`relabel_probabilities` applies). A regime
+    with no weighted member gets ``None`` moments rather than NaN, so the
+    payload schema can carry it without a magic value. A single-state regime
+    reproduces that state's values exactly.
+    """
+    weighted = [
+        stat
+        for stat in members
+        if stat.occupancy > 0.0 and np.isfinite(stat.mean_return) and np.isfinite(stat.volatility)
+    ]
+
+    ann_return = ann_volatility = sharpe = None
+    weights = np.array([stat.occupancy for stat in weighted], dtype="float64")
+    if weighted:
+        total = float(weights.sum())
+        mus = np.array([stat.mean_return / _TRADING_DAYS for stat in weighted])
+        variances = np.array([stat.volatility**2 / _TRADING_DAYS for stat in weighted])
+        mu = float(np.dot(weights, mus) / total)
+        variance = max(float(np.dot(weights, variances + mus**2) / total) - mu**2, 0.0)
+        ann_return = mu * _TRADING_DAYS
+        ann_volatility = float(np.sqrt(variance * _TRADING_DAYS))
+        sharpe = _sharpe(ann_return, ann_volatility)
+
+    stress_score: float | None = None
+    if weighted:
+        if all(stat.stress_score is not None for stat in weighted):
+            scores = np.array(
+                [cast(float, stat.stress_score) for stat in weighted],
+                dtype="float64",
+            )
+            stress_score = float(np.dot(weights, scores) / total)
+    elif all(stat.stress_score is not None for stat in members):
+        scores = np.array(
+            [cast(float, stat.stress_score) for stat in members],
+            dtype="float64",
+        )
+        stress_score = float(scores.mean())
+
+    return RegimeStatistics(
+        regime=regime,
+        raw_states=tuple(sorted(stat.state for stat in members)),
+        occupancy=min(sum(stat.occupancy for stat in members), 1.0),
+        ann_return=ann_return,
+        ann_volatility=ann_volatility,
+        sharpe=sharpe,
+        stress_score=stress_score,
+        n_observations=sum(stat.n_observations for stat in members),
+    )
 
 
 def summarise_states(
     reference_returns: pd.Series,
     posteriors: pd.DataFrame,
     *,
-    trading_days: int = 252,
+    trading_days: int = _TRADING_DAYS,
 ) -> tuple[StateStatistics, ...]:
     """Summarise each state's conditional return distribution.
 

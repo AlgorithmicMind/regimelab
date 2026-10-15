@@ -23,10 +23,12 @@ from regimelab.data.providers import (
     resolve_provider,
 )
 from regimelab.features import build_feature_matrix
+from regimelab.models.labeling import StateStatistics, assign_labels
 from regimelab.models.types import (
     FeatureSnapshot,
     MarketRegime,
     ModelMetadata,
+    RankingMethod,
     RegimeProbabilities,
     RegimeStatistics,
     TelemetryPayload,
@@ -292,7 +294,7 @@ def _statistics() -> tuple[RegimeStatistics, ...]:
     return (
         RegimeStatistics(
             regime=MarketRegime.BULL_TREND,
-            raw_state=0,
+            raw_states=(0,),
             occupancy=0.6,
             ann_return=0.10,
             ann_volatility=0.12,
@@ -301,7 +303,7 @@ def _statistics() -> tuple[RegimeStatistics, ...]:
         ),
         RegimeStatistics(
             regime=MarketRegime.RISK_OFF,
-            raw_state=1,
+            raw_states=(1,),
             occupancy=0.4,
             ann_return=-0.20,
             ann_volatility=0.35,
@@ -321,7 +323,7 @@ def test_state_statistics_validator_and_lookup() -> None:
         state_statistics=_statistics(),
     )
 
-    assert payload.statistics_for(MarketRegime.RISK_OFF).raw_state == 1
+    assert payload.statistics_for(MarketRegime.RISK_OFF).raw_states == (1,)
     with pytest.raises(KeyError, match="no state statistics for NEUTRAL_TRANSITION"):
         payload.statistics_for(MarketRegime.NEUTRAL_TRANSITION)
 
@@ -361,3 +363,83 @@ def test_state_statistics_on_payloads(
     # A 3-state ladder has no HIGH_VOL_BEAR entry.
     with pytest.raises(KeyError, match="no state statistics"):
         single.statistics_for(MarketRegime.HIGH_VOL_BEAR)
+
+
+def test_payload_accepts_combined_state_statistics() -> None:
+    """A duplicate-regime mapping (guardrail) produces unique statistics.
+
+    Regression for the 0.3.0 bug: under VOLATILITY/SHARPE the positive-drift
+    guardrail can map two states to the same regime, and one-entry-per-state
+    statistics then broke the payload's uniqueness validator.
+    """
+    stats = (
+        StateStatistics(
+            state=0, occupancy=0.4, mean_return=0.15, volatility=0.10, n_observations=400
+        ),
+        StateStatistics(
+            state=1, occupancy=0.3, mean_return=0.05, volatility=0.20, n_observations=300
+        ),
+        StateStatistics(
+            state=2, occupancy=0.3, mean_return=0.02, volatility=0.30, n_observations=300
+        ),
+    )
+    assignment = assign_labels(stats, method=RankingMethod.VOLATILITY)
+    assert len(set(assignment.mapping.values())) < len(assignment.mapping)
+
+    asof = dt.date(2020, 1, 10)
+    payload = _payload(
+        asof=asof,
+        session_date=asof,
+        observation_date=asof,
+        state_statistics=assignment.to_statistics(),
+    )
+
+    assert len(payload.state_statistics) == 2
+    assert payload.statistics_for(MarketRegime.NEUTRAL_TRANSITION).raw_states == (1, 2)
+
+
+@pytest.fixture(scope="module")
+def gmm_pipeline(test_settings: Settings) -> tuple[Settings, PipelineResult]:
+    """A full pipeline run under ``gmm`` (VOLATILITY ranking), once per module."""
+    settings = test_settings.model_copy(
+        update={
+            "model": test_settings.model.model_copy(update={"classifier": "gmm"}),
+        },
+    )
+    return settings, pipeline.run_pipeline(settings, command="test-gmm")
+
+
+def test_gmm_telemetry_carries_unique_state_statistics(
+    gmm_pipeline: tuple[Settings, PipelineResult],
+) -> None:
+    """VOLATILITY-ranked payloads stay valid even when states share a regime."""
+    settings, result = gmm_pipeline
+
+    payload = pipeline.latest_telemetry(result)
+    assert payload.state_statistics
+    regimes = [entry.regime for entry in payload.state_statistics]
+    assert len(set(regimes)) == len(regimes)
+    assert regimes == sorted(regimes, key=lambda regime: regime.risk_rank)
+
+    asof = result.walkforward.labels.index[-1].date()
+    single = pipeline.run_single_asof(settings, asof)
+    single_regimes = [entry.regime for entry in single.state_statistics]
+    assert len(set(single_regimes)) == len(single_regimes)
+    assert single_regimes == sorted(single_regimes, key=lambda regime: regime.risk_rank)
+
+    # On the synthetic panel the gmm fit does produce duplicate mappings:
+    # folds exist whose model maps two states to the same regime. The as-of
+    # path inside such a fold is the reported crash -- it must stay valid.
+    duplicate_fold = next(
+        (
+            fold
+            for fold in result.walkforward.folds
+            if any(len(entry.raw_states) > 1 for entry in fold.statistics)
+        ),
+        None,
+    )
+    assert duplicate_fold is not None
+    probe = pipeline.run_single_asof(settings, duplicate_fold.test_end)
+    probe_regimes = [entry.regime for entry in probe.state_statistics]
+    assert len(set(probe_regimes)) == len(probe_regimes)
+    assert any(len(entry.raw_states) > 1 for entry in probe.state_statistics)

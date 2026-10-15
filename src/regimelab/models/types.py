@@ -352,24 +352,48 @@ class RegimeStatistics(_Frozen):
 
     These describe the model's *training* window, not the period the payload
     reports on: they are the moments of the return distribution conditional on
-    the state that ``regime`` was mapped from.
+    the states mapped to ``regime``. Several raw states can share a regime --
+    the positive-drift guardrail maps extra positive-drift states onto the
+    most risk-off non-bear label -- so the moments are the occupancy-weighted
+    combination over ``raw_states``, mirroring how
+    :func:`~regimelab.models.labeling.relabel_probabilities` sums their
+    posteriors.
     """
 
     regime: MarketRegime
-    raw_state: Annotated[int, Field(ge=0)]
-    """Index of the latent state this regime was mapped from."""
+    raw_states: tuple[int, ...]
+    """Raw latent-state indices mapped to this regime, sorted ascending."""
     occupancy: Annotated[float, Field(ge=0.0, le=1.0)]
-    """Share of the training sample assigned to the state."""
-    ann_return: float
-    """Posterior-weighted conditional mean return, annualised."""
-    ann_volatility: Annotated[float, Field(ge=0.0)]
-    """Posterior-weighted conditional volatility, annualised."""
-    sharpe: float
-    """``ann_return / ann_volatility``; ``0.0`` for a degenerate state."""
+    """Combined share of the training sample assigned to the member states."""
+    ann_return: float | None = None
+    """Posterior-weighted conditional mean return, annualised. ``None`` when
+    no member state carries weight."""
+    ann_volatility: Annotated[float, Field(ge=0.0)] | None = None
+    """Posterior-weighted conditional volatility, annualised. ``None`` when no
+    member state carries weight."""
+    sharpe: float | None = None
+    """``ann_return / ann_volatility``; ``0.0`` for a degenerate state,
+    ``None`` when no member state carries weight."""
     stress_score: float | None = None
     """Signed stress score under STRESS ranking; ``None`` otherwise."""
     n_observations: Annotated[int, Field(ge=0)]
-    """Effective observations assigned to the state."""
+    """Combined effective observations assigned to the member states."""
+
+    @model_validator(mode="after")
+    def _check_raw_states(self) -> Self:
+        if not self.raw_states:
+            msg = "raw_states must not be empty"
+            raise ValueError(msg)
+        if any(state < 0 for state in self.raw_states):
+            msg = f"raw_states must be non-negative: {self.raw_states}"
+            raise ValueError(msg)
+        if tuple(sorted(self.raw_states)) != self.raw_states:
+            msg = f"raw_states must be sorted ascending: {self.raw_states}"
+            raise ValueError(msg)
+        if len(set(self.raw_states)) != len(self.raw_states):
+            msg = f"raw_states must be unique: {self.raw_states}"
+            raise ValueError(msg)
+        return self
 
 
 class ModelMetadata(_Frozen):
