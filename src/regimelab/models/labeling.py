@@ -47,6 +47,7 @@ from regimelab.models.types import (
     STRESS_SIGNS,
     MarketRegime,
     RankingMethod,
+    RegimeStatistics,
     regime_ladder,
 )
 
@@ -161,21 +162,47 @@ class LabelAssignment:
             msg = f"state {state} was not present in the fit that produced this assignment"
             raise KeyError(msg) from None
 
+    def to_statistics(self) -> tuple[RegimeStatistics, ...]:
+        """Per-regime training-window statistics, ordered by the risk ladder.
+
+        One entry per fitted state, carrying the regime it was mapped to. The
+        ordering key is the regime's position on the canonical ladder, so the
+        result reads risk-on to risk-off regardless of raw state order.
+        """
+        entries = [
+            RegimeStatistics(
+                regime=self.mapping[stat.state],
+                raw_state=stat.state,
+                occupancy=stat.occupancy,
+                ann_return=stat.mean_return,
+                ann_volatility=stat.volatility,
+                sharpe=stat.sharpe,
+                stress_score=stat.stress_score,
+                n_observations=stat.n_observations,
+            )
+            for stat in self.statistics
+        ]
+        return tuple(sorted(entries, key=lambda entry: entry.regime.risk_rank))
+
     def describe(self) -> pd.DataFrame:
-        """Tabular summary for reports and the dashboard."""
+        """Tabular summary for reports and the dashboard.
+
+        Rows are in ladder order (risk-on to risk-off), matching
+        :meth:`to_statistics`.
+        """
         return pd.DataFrame(
             [
                 {
-                    "regime": self.mapping[stat.state].value,
-                    "raw_state": stat.state,
-                    "occupancy": stat.occupancy,
-                    "ann_return": stat.mean_return,
-                    "ann_volatility": stat.volatility,
-                    "sharpe": stat.sharpe,
-                    "stress_score": stat.stress_score,
-                    "observations": stat.n_observations,
+                    "regime": entry.regime.value,
+                    "raw_state": entry.raw_state,
+                    "occupancy": entry.occupancy,
+                    "ann_return": entry.ann_return,
+                    "ann_volatility": entry.ann_volatility,
+                    "sharpe": entry.sharpe,
+                    "stress_score": entry.stress_score,
+                    "observations": entry.n_observations,
                 }
-                for stat in self.statistics
+                for entry in self.to_statistics()
             ],
         )
 

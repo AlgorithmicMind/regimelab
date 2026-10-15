@@ -32,9 +32,7 @@ from regimelab.backtest.walkforward import (
     oos_train_end,
     run_walk_forward,
 )
-from regimelab.data.alignment import align_panel
-from regimelab.data.fetcher import PanelFetcher
-from regimelab.data.providers import resolve_provider
+from regimelab.data.fetcher import load_aligned_panel
 from regimelab.features import build_feature_matrix, snapshot_at
 from regimelab.models.base import InsufficientDataError, probabilities_from_row
 from regimelab.models.registry import build_classifier
@@ -83,17 +81,16 @@ class PipelineResult:
         return self.walkforward.backtest
 
 
-def _fetch_and_align(settings: Settings) -> AlignedPanel:
-    """Fetch data through the configured provider and enforce PIT alignment."""
-    provider = resolve_provider(settings)
-    cache_dir = settings.artifacts_dir / "cache"
-    fetcher = PanelFetcher(provider, cache_dir, ttl_hours=0)
-    raw = fetcher.fetch(
-        settings.data.all_symbols,
-        settings.data.start,
-        settings.data.end,
-    )
-    return align_panel(raw, anchor=settings.data.benchmark)
+def _fetch_and_align(settings: Settings, *, force_refresh: bool = False) -> AlignedPanel:
+    """Fetch data through the configured provider and enforce PIT alignment.
+
+    Every pipeline entry point goes through
+    :func:`~regimelab.data.fetcher.load_aligned_panel`: alignment anchors on
+    ``data.calendar_anchor``, the panel cache lives in ``data.cache_dir`` and
+    is reused within ``data.cache_ttl_hours``. ``force_refresh`` bypasses the
+    cache and always refetches.
+    """
+    return load_aligned_panel(settings, force_refresh=force_refresh)
 
 
 def _fit_single_model(
@@ -168,6 +165,7 @@ def run_pipeline(
     run_backtest: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
     status_callback: Callable[[str], None] | None = None,
+    force_refresh: bool = False,
 ) -> PipelineResult:
     """Run the full point-in-time pipeline.
 
@@ -184,6 +182,8 @@ def run_pipeline(
         with ``(current_fold, total_folds, test_date)``.
     status_callback
         Optional callback invoked with human-readable phase descriptions.
+    force_refresh
+        Bypass the panel cache and refetch, ignoring ``cache_ttl_hours``.
 
     Returns
     -------
@@ -192,7 +192,7 @@ def run_pipeline(
     """
     if status_callback is not None:
         status_callback("Fetching & aligning PIT market data...")
-    panel = _fetch_and_align(settings)
+    panel = _fetch_and_align(settings, force_refresh=force_refresh)
 
     if status_callback is not None:
         status_callback("Computing systemic risk feature matrix...")
@@ -258,17 +258,33 @@ def latest_telemetry(result: PipelineResult) -> TelemetryPayload:
             weights=result.settings.backtest.regime_weights[regime],
         )
 
-    last_fold = result.walkforward.folds[-1]
-    metadata = last_fold.model
+    # The payload is signed by the model of the fold that labelled
+    # ``observed`` -- the interval is inclusive on both ends, matching the
+    # walk-forward convention that fold k owns (r_k, r_{k+1}] plus its
+    # first labelled session.
+    observation_date = observed.date()
+    fold = next(
+        (
+            candidate
+            for candidate in result.walkforward.folds
+            if candidate.test_start <= observation_date <= candidate.test_end
+        ),
+        None,
+    )
+    if fold is None:
+        msg = f"no walk-forward fold covers observation_date {observation_date.isoformat()}"
+        raise ValueError(msg)
+    metadata = fold.model
 
     return TelemetryPayload(
         asof=asof.date(),
         session_date=asof.date(),
-        observation_date=observed.date(),
+        observation_date=observation_date,
         regime=regime,
         probabilities=probabilities,
         features=snapshot,
         model=metadata,
+        state_statistics=fold.statistics,
         target_weights=target_weights,
         warnings=_data_quality_warnings(
             asof=asof.date(),
@@ -306,6 +322,7 @@ def run_single_asof(
     command: str = "asof",
     fitted: FittedRegime | None = None,
     refit_policy: Literal["walkforward", "daily"] = "walkforward",
+    force_refresh: bool = False,
 ) -> TelemetryPayload:
     """Produce a telemetry payload for a specific historical as-of date.
 
@@ -326,8 +343,11 @@ def run_single_asof(
     policy does not apply.  Instead the supplied
     :class:`~regimelab.models.base.FittedRegime` is filtered causally through
     ``asof`` using its frozen parameters and standardiser.
+
+    ``force_refresh`` bypasses the panel cache and refetches, ignoring
+    ``cache_ttl_hours``.
     """
-    panel = _fetch_and_align(settings)
+    panel = _fetch_and_align(settings, force_refresh=force_refresh)
     features = build_feature_matrix(panel, settings)
     returns = panel.log_returns([settings.data.benchmark])[settings.data.benchmark]
 
@@ -392,6 +412,7 @@ def run_single_asof(
         probabilities=probabilities,
         features=snapshot,
         model=fit.metadata,
+        state_statistics=fit.assignment.to_statistics(),
         target_weights=target_weights,
         warnings=_data_quality_warnings(
             asof=asof,

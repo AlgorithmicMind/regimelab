@@ -36,7 +36,12 @@ import pandas as pd
 from regimelab.backtest.engine import run_backtest as run_backtest_engine
 from regimelab.models.base import InsufficientDataError, probabilities_from_row
 from regimelab.models.registry import build_classifier
-from regimelab.models.types import MarketRegime, ModelMetadata, RegimeProbabilities
+from regimelab.models.types import (
+    MarketRegime,
+    ModelMetadata,
+    RegimeProbabilities,
+    RegimeStatistics,
+)
 
 if TYPE_CHECKING:
     from regimelab.backtest.engine import BacktestResult
@@ -67,6 +72,10 @@ class WalkForwardFold:
     n_test: int
     model: ModelMetadata
     assignment: pd.DataFrame | None = None
+    statistics: tuple[RegimeStatistics, ...] = ()
+    """Per-regime training-window statistics of the fold's fitted model, in
+    ladder order. These describe ``train_start``..``train_end``, not the
+    fold's test interval."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +315,7 @@ def run_walk_forward(
                 n_test=probs.shape[0],
                 model=fit.metadata,
                 assignment=fit.assignment.describe(),
+                statistics=fit.assignment.to_statistics(),
             ),
         )
 

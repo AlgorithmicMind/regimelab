@@ -23,6 +23,7 @@ def test_settings() -> Settings:
             "provider": "synthetic",
             "start": dt.date(2015, 1, 1),
             "end": dt.date(2020, 12, 31),
+            "cache_dir": Path(".test-artifacts") / "cache",
         },
         features={
             "absorption_window": 120,

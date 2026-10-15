@@ -6,6 +6,7 @@ from regimelab.backtest.engine import (
     CASH_COLUMN,
     BacktestResult,
     run_backtest,
+    simulate_weights,
     target_weight_frame,
 )
 from regimelab.backtest.metrics import (
@@ -33,5 +34,6 @@ __all__ = [
     "regime_conditional_metrics",
     "run_backtest",
     "run_walk_forward",
+    "simulate_weights",
     "target_weight_frame",
 ]

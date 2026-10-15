@@ -30,9 +30,9 @@ All sections are immutable (`frozen=True`) and ignore unmapped foreign environme
 | `correlation_assets` | `tuple[str, ...]` | `("SPY", "TLT", "GLD")` | Signal universe for the cross-asset correlation features; independent of `risk_assets`. |
 | `start` | `dt.date` | `2005-01-01` | Start date for data ingestion. |
 | `end` | `dt.date \| None` | `None` | End date (`None` means latest available). |
-| `cache_dir` | `Path` | `platformdirs.user_cache_dir("regimelab")` | Local cache directory. |
-| `cache_ttl_hours` | `float` | `12.0` | Cache TTL for open-ended network requests. |
-| `calendar_anchor` | `str` | `"SPY"` | Symbol that defines the master calendar. |
+| `cache_dir` | `Path` | `platformdirs.user_cache_dir("regimelab")` | Panel cache directory — the pipeline data path (`load_aligned_panel`) stores provider responses here. |
+| `cache_ttl_hours` | `float` | `12.0` | Cached panels younger than this are reused. `0` forces refetch; `force_refresh=True` bypasses the cache per call. |
+| `calendar_anchor` | `str` | `"SPY"` | Symbol that defines the master calendar; the alignment anchor for the pipeline data path. |
 
 **Public properties**
 
@@ -204,7 +204,7 @@ Submodules are reachable but considered reorganizable internals.
   - `fetch(symbols, start, end, *, force_refresh=False) -> pd.DataFrame`
   - Content-addressed caching (`sha256` of provider, symbols, range).
   - Closed ranges (`end` fixed) cache indefinitely; open ranges use `ttl_hours`.
-- `load_aligned_panel(settings, *, end=None, force_refresh=False) -> AlignedPanel` — entry point combining provider, fetcher, and `align_panel`.
+- `load_aligned_panel(settings, *, end=None, force_refresh=False) -> AlignedPanel` — entry point combining provider, fetcher, and `align_panel`. **The single data path**: `pipeline._fetch_and_align` delegates to it, so every pipeline entry point shares this cache (`data.cache_dir` within `data.cache_ttl_hours`), this anchor (`data.calendar_anchor`) and this clipping (`data.start`/`end`).
 
 ### 2.5 `regimelab.features` — Feature Engineering
 
@@ -283,10 +283,13 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
   - Method: `normalise(symbols=None) -> dict[str, float]`
 - `ModelMetadata`:
   - Fields: `name`, `n_states`, `seed`, `train_start`, `train_end`, `n_train_observations`, `converged`, `log_likelihood`, `feature_names`
+- `RegimeStatistics` (frozen Pydantic): `regime: MarketRegime`, `raw_state: int (>=0)`, `occupancy: float [0,1]`, `ann_return: float`, `ann_volatility: float (>=0)`, `sharpe: float`, `stress_score: float | None`, `n_observations: int (>=0)` — per-regime statistics of the training window of the model that produced them.
 - `TelemetryPayload`:
-  - Fields: `asof`, `session_date`, `observation_date`, `regime`, `probabilities`, `features`, `model`, `target_weights`, `warnings`
+  - Fields: `asof`, `session_date`, `observation_date`, `regime`, `probabilities`, `features`, `model`, `state_statistics`, `target_weights`, `warnings`
+  - `state_statistics: tuple[RegimeStatistics, ...]` — describes the *training window* of the model signing the payload (`model.train_start..train_end`), not the live filtering window.
   - Property: `is_stale -> bool` (`observation_date < session_date`)
-  - Validators: `model.train_end <= asof` (last line of defence against look-ahead), `observation_date <= session_date <= asof`, regime consistency vs. probabilities.
+  - Method: `statistics_for(regime) -> RegimeStatistics` — `KeyError` when the regime is not covered.
+  - Validators: `model.train_end <= asof` (last line of defence against look-ahead), `observation_date <= session_date <= asof`, regime consistency vs. probabilities, no duplicate regimes in `state_statistics`.
 
 #### 2.6.2 `regimelab.models.base`
 
@@ -335,7 +338,9 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 - `STRESS_SIGNS` — default signed stress contribution per feature, defined in `regimelab.models.types` and re-exported here (`mean_correlation` excluded: its stress sign is unstable across eras; see `ModelSettings.stress_signs` for configuration)
 - `OccupancyError(ValueError)`
 - `StateStatistics` (dataclass): `state`, `occupancy`, `mean_return`, `volatility`, `n_observations`, `stress_score`; property `sharpe`
-- `LabelAssignment` (dataclass): `mapping`, `statistics`, `method`; property `inverse`; methods `regime_of(state)`, `describe() -> pd.DataFrame`
+- `LabelAssignment` (dataclass): `mapping`, `statistics`, `method`; property `inverse`; methods `regime_of(state)`, `to_statistics() -> tuple[RegimeStatistics, ...]`, `describe() -> pd.DataFrame`
+  - `to_statistics` returns one `RegimeStatistics` per fitted state, ordered by the regime's ladder position (`risk_rank`).
+  - `describe()` is built from `to_statistics()` — same columns as before (`regime`, `raw_state`, `occupancy`, `ann_return`, `ann_volatility`, `sharpe`, `stress_score`, `observations`), rows now in ladder order rather than raw-state order.
 - `summarise_states(reference_returns, posteriors, *, trading_days=252) -> tuple[StateStatistics, ...]`
 - `stress_scores(emission_means, feature_names, *, signs=STRESS_SIGNS) -> np.ndarray` — mean signed standardised emission mean per state over the `signs` features
 - `assign_labels(statistics, *, method=SHARPE, min_occupancy=0.0, emission_means=None, feature_names=None, signs=STRESS_SIGNS) -> LabelAssignment` — `emission_means`/`feature_names` required under `STRESS`, `signs` forwarded to `stress_scores`; the positive-drift guardrail does not apply under `STRESS`
@@ -354,17 +359,27 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 
 - `CASH_COLUMN = "CASH"`
 - `BacktestResult` (dataclass):
-  - Fields: `regimes`, `target_weights`, `held_weights`, `gross_returns`, `net_returns`, `traded_notional`, `costs`, `equity`, `benchmark_returns`, `benchmark_equity`, `metrics`, `benchmark_metrics`, `regime_metrics`
+  - Fields: `regimes` (`pd.Series | None`), `target_weights`, `held_weights`, `gross_returns`, `net_returns`, `traded_notional`, `costs`, `equity`, `benchmark_returns`, `benchmark_equity`, `metrics`, `benchmark_metrics`, `regime_metrics` (`pd.DataFrame | None`)
+  - `regimes` and `regime_metrics` are `None` when `simulate_weights` ran without a regime path; `to_frame()` omits the `regime` column in that case.
   - Properties: `drawdown`, `benchmark_drawdown`, `excess_return`
   - Methods: `comparison_table() -> pd.DataFrame`, `to_frame() -> pd.DataFrame`
 - `target_weight_frame(regimes, settings, symbols) -> pd.DataFrame` — converts a regime path into target weights.
-- `run_backtest(prices, regimes, settings, *, confidence=None, start=None) -> BacktestResult`
+- `simulate_weights(prices, target_weights, settings, *, start=None, regimes=None) -> BacktestResult` — the public execution engine: simulates a hand-supplied decision frame under the same lag/rebalancing/cost mechanics as `run_backtest`. `target_weights` holds the aligned input schedule.
+- `run_backtest(prices, regimes, settings, *, confidence=None, start=None) -> BacktestResult` — builds the regime-implied schedule (regime-change adoption + `confidence_floor` suppression, leading blanked sessions filled with CASH) and delegates to `simulate_weights`; `target_weights` keeps its meaning: regime-implied targets before scheduling.
 
-**`run_backtest` logic**
+**`simulate_weights` validation** (all `ValueError`)
 
-- Event-driven rebalancing (only when the regime changes).
-- `signal_lag_days` delay between signal observation and position.
-- `confidence_floor`: if modal confidence is below the floor, the previous allocation is retained.
+- No NaN weights; columns must be a subset of `risk_assets ∪ {CASH}`.
+- A positive weight on a risk asset absent from `prices` is rejected; missing investable columns fill with 0; column order is `[*investable, CASH]`.
+- Weights must lie in `[0, 1]` and the risk sum may not exceed 1, within `_WEIGHT_TOLERANCE = 1e-9`.
+- A supplied `CASH` column must equal `1 - sum(risk weights)`; absent, it is computed as `max(0, 1 - sum)`.
+- Decision dates outside `prices.index` are rejected; a decision holds until the next one (`reindex(prices.index).ffill()` — causal).
+
+**`run_backtest`/`simulate_weights` mechanics**
+
+- Event-driven rebalancing: a target is adopted only when it differs from the last *adopted* target by more than `_TRADE_THRESHOLD = 1e-9`, so sub-threshold drift cannot accumulate.
+- `signal_lag_days` delay between signal observation and position; sessions before the first executable decision are fully in cash.
+- `confidence_floor`: if modal confidence is below the floor, the previous allocation is retained; leading sessions blanked by the floor hold 100% CASH and earn the risk-free rate (0.3.0 fix — previously they held zero weights and earned nothing).
 - Costs = `transaction_cost_bps / 1e4 * traded_notional`.
 - Unallocated cash earns the daily `risk_free_rate`.
 - No leverage, no shorting.
@@ -381,7 +396,7 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 
 #### 2.7.3 `regimelab.backtest.walkforward`
 
-- `WalkForwardFold` (dataclass): `fold_index`, `train_start`, `train_end`, `test_start`, `test_end`, `n_train`, `n_test`, `model: ModelMetadata`, `assignment: pd.DataFrame | None`
+- `WalkForwardFold` (dataclass): `fold_index`, `train_start`, `train_end`, `test_start`, `test_end`, `n_train`, `n_test`, `model: ModelMetadata`, `assignment: pd.DataFrame | None`, `statistics: tuple[RegimeStatistics, ...]` — the fold model's per-regime training-window statistics, in ladder order.
 - `WalkForwardResult` (dataclass): `labels`, `probabilities`, `confidence`, `folds`, `features`, `backtest: BacktestResult | None`
   - Property `regimes` (alias of `labels`)
   - Methods: `regime_probabilities(asof) -> RegimeProbabilities`, `posterior_at(asof) -> tuple[RegimeProbabilities, pd.Timestamp]`
@@ -403,12 +418,14 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 
 - `PipelineResult` (dataclass): `settings`, `panel`, `features`, `walkforward`, `manifest`, `store`
   - Property `backtest -> BacktestResult | None`
-- `latest_telemetry(result) -> TelemetryPayload`
-- `run_pipeline(settings, *, command="run", run_backtest=True) -> PipelineResult`
-- `run_single_asof(settings, asof, *, command="asof", fitted=None, refit_policy="walkforward") -> TelemetryPayload`
+- `latest_telemetry(result) -> TelemetryPayload` — signs the payload with the model and `state_statistics` of the fold whose `[test_start, test_end]` contains `observation_date` (raises `ValueError` if none does), replacing the 0.2.0 "always last fold" behaviour.
+- `run_pipeline(settings, *, command="run", run_backtest=True, progress_callback=None, status_callback=None, force_refresh=False) -> PipelineResult`
+- `run_single_asof(settings, asof, *, command="asof", fitted=None, refit_policy="walkforward", force_refresh=False) -> TelemetryPayload`
   - `refit_policy="walkforward"` (default): finds the last scheduled refit strictly before the last usable observation and filters with frozen parameters — reproduces the walk-forward signal exactly.
   - `refit_policy="daily"`: previous behaviour; fits through `asof` itself.
   - `fitted` wins over either policy: the supplied `FittedRegime` is filtered causally without retraining.
+  - `force_refresh` bypasses the panel cache for that call.
+  - The payload's `state_statistics` are `fit.assignment.to_statistics()` — the signing model's training-window statistics.
 - `RunCommand` (callable): wrapper for CLI/tests.
 
 **Artifacts written by `run_pipeline` in the `RunStore`**
@@ -467,6 +484,7 @@ TelemetryPayload(
     probabilities=RegimeProbabilities,
     features=FeatureSnapshot,
     model=ModelMetadata,
+    state_statistics=tuple[RegimeStatistics, ...],
     target_weights=AllocationWeights | None,
     warnings=tuple[str, ...],
 )
@@ -479,6 +497,7 @@ TelemetryPayload(
 - `probabilities`: full posterior distribution (dict `MarketRegime -> float`).
 - `features`: causal systemic-risk snapshot.
 - `model`: fit metadata (name, seed, training range, etc.).
+- `state_statistics`: per-regime statistics of the *training window* of the model signing the payload (`model.train_start..train_end`), in ladder order; `statistics_for(regime)` looks one up (`KeyError` when uncovered). Duplicate regimes are rejected by validation.
 - `target_weights`: current-regime target weights, or `None` if no backtest is configured.
 - `warnings`: data-quality degradations reported by the pipeline, in order: `non_session_asof`, `stale_observation`, `missing_feature`, `stale_input`, `dropped_symbol`. The payload describes the gap but never fills it; whether to publish is the consumer's decision.
 
@@ -487,6 +506,7 @@ TelemetryPayload(
 - `model.train_end <= asof` (last line of defence against look-ahead).
 - `observation_date <= session_date <= asof`.
 - `regime` must appear in `probabilities`.
+- `state_statistics` may not contain duplicate regimes.
 
 ### 3.2 `PipelineResult`
 
@@ -513,7 +533,7 @@ PipelineResult(
 
 ```python
 BacktestResult(
-    regimes=pd.Series,
+    regimes=pd.Series | None,
     target_weights=pd.DataFrame,
     held_weights=pd.DataFrame,
     gross_returns=pd.Series,
@@ -525,10 +545,11 @@ BacktestResult(
     benchmark_equity=pd.Series,
     metrics=PerformanceMetrics,
     benchmark_metrics=PerformanceMetrics,
-    regime_metrics=pd.DataFrame,
+    regime_metrics=pd.DataFrame | None,
 )
 ```
 
+- `regimes`: regime in force per session, or `None` when `simulate_weights` ran without a regime path.
 - `target_weights`: theoretical per-session weights.
 - `held_weights`: weights retained after lag and confidence floor.
 - `gross_returns`: return before costs.
@@ -536,7 +557,7 @@ BacktestResult(
 - `traded_notional`: turnover per session.
 - `costs`: transaction cost per session.
 - `metrics` vs `benchmark_metrics`: strategy and buy-and-hold metrics.
-- `regime_metrics`: benchmark conditional statistics per regime.
+- `regime_metrics`: benchmark conditional statistics per regime, or `None` without a regime path.
 
 ### 3.4 `WalkForwardResult`
 
@@ -564,6 +585,7 @@ WalkForwardFold(
     n_test=int,
     model=ModelMetadata,
     assignment=pd.DataFrame | None,
+    statistics=tuple[RegimeStatistics, ...],
 )
 ```
 
@@ -631,7 +653,7 @@ In addition, the panel cache (`settings.data.cache_dir / panels / <sha16>.parque
 
 ## 4. Test List
 
-Files: `tests/conftest.py`, `tests/test_backtest.py`, `tests/test_causality.py`, `tests/test_labeling.py`, `tests/test_labeling_synthetic.py`, `tests/test_model_persistence.py`, `tests/test_official_volatility.py`, `tests/test_settings_env.py`, `tests/test_signal_universe.py`, `tests/test_telemetry_quality.py`. All tests run offline against the synthetic provider or fixture frames; official-volatility tests monkeypatch `_read_csv`.
+Files: `tests/conftest.py`, `tests/test_backtest.py`, `tests/test_causality.py`, `tests/test_data_path.py`, `tests/test_labeling.py`, `tests/test_labeling_synthetic.py`, `tests/test_model_persistence.py`, `tests/test_official_volatility.py`, `tests/test_settings_env.py`, `tests/test_signal_universe.py`, `tests/test_simulate_weights.py`, `tests/test_telemetry_quality.py`. All tests run offline against the synthetic provider or fixture frames; official-volatility tests monkeypatch `_read_csv`.
 
 ### 4.1 Shared fixtures (`conftest.py`)
 
@@ -694,49 +716,65 @@ Parametrized for three dates: `2020-03-16`, `2020-06-15`, `2020-12-31`. Counts a
 16. **`test_asof_daily_refit_policy_keeps_old_behaviour`**  
     `refit_policy="daily"` fits through the as-of date, so `payload.model.train_end == asof`.
 
-### 4.4 `tests/test_labeling.py`
+### 4.4 `tests/test_data_path.py`
+
+- **`test_pipeline_panel_equals_load_aligned_panel`**: `run_pipeline(settings).panel` equals `load_aligned_panel(settings)` — close frame, staleness frame and `dropped_symbols`.
+- **`test_force_refresh_bypasses_the_panel_cache`**: a counting provider wrapper proves `force_refresh=True` refetches even with a fresh cache entry.
+
+### 4.5 `tests/test_labeling.py`
 
 - STRESS ranking orders states by signed emission means over `STRESS_SIGNS`, is bijective even when all drifts are positive (the positive-drift guardrail is skipped), and breaks ties on volatility then state index.
 - SHARPE/MEAN_RETURN/VOLATILITY behaviours, including the drift guardrail and aggregate-duplicate relabelling.
 - `ModelSettings.ranking_method` overrides the classifier default.
 - `ModelSettings.stress_signs` replaces `STRESS_SIGNS` entirely: custom signs change the fitted assignment, coverage is validated only when STRESS is in effect, and each registry classifier's `ranking_method` ClassVar equals `DEFAULT_RANKING_METHODS[name]`.
+- `LabelAssignment.to_statistics()` returns `RegimeStatistics` in ladder order; `describe()` exposes the same columns in that order.
 
-### 4.5 `tests/test_labeling_synthetic.py`
+### 4.6 `tests/test_labeling_synthetic.py`
 
 - On synthetic data with known latent states, STRESS labelling recovers the stress state and emits every canonical regime exactly once.
 
-### 4.6 `tests/test_model_persistence.py`
+### 4.7 `tests/test_model_persistence.py`
 
 - `FittedRegimeBundle` save/load round-trips the frozen model.
 - `run_single_asof(settings, asof, fitted=fit)` reuses the persisted model without refitting.
 
-### 4.7 `tests/test_official_volatility.py`
+### 4.8 `tests/test_official_volatility.py`
 
 - CBOE/FRED CSV parsing, per-date source priority, CBOE failure → FRED fallback, both-official failure → configured-provider fallback, inclusive range clipping.
 - `VolatilityRoutingProvider` splits symbol groups; `resolve_provider` routing matrix; cache key differentiates `volatility_source`.
 
-### 4.8 `tests/test_settings_env.py`
+### 4.9 `tests/test_settings_env.py`
 
 - Environment-variable overrides map only to `REGIMELAB_*` prefixed names and reject invalid values.
 
-### 4.9 `tests/test_signal_universe.py`
+### 4.10 `tests/test_signal_universe.py`
 
 - Changing `risk_assets` (with matching `regime_weights`) leaves the feature matrix identical; changing `correlation_assets` changes `mean_correlation`.
 - `correlation_assets` validator requires at least two symbols; symbols not in `risk_assets` still reach `all_symbols` through `correlation_assets`.
 
-### 4.10 `tests/test_telemetry_quality.py`
+### 4.11 `tests/test_simulate_weights.py`
+
+- **`test_run_backtest_matches_golden`**: golden regression — `run_backtest` rewritten on `simulate_weights` reproduces `tests/data/backtest_golden.parquet` (generated once from the 0.2.0 engine) at `atol=1e-12, rtol=0`.
+- **`test_simulate_weights_constant_6040`** / **`test_simulate_weights_accepts_consistent_cash`**: a static target trades once after the lag, never again; `regimes`/`regime_metrics` are `None` and `to_frame()` omits the regime column.
+- **`test_simulate_weights_reproduces_run_backtest`**: feeding `run_backtest`'s decision schedule into `simulate_weights` reproduces net returns and traded notional exactly.
+- **`test_leading_low_confidence_holds_cash`**: sessions blanked by the confidence floor hold 100% CASH and earn the risk-free rate.
+- **`test_sub_threshold_weight_changes_do_not_trade`**: target drift below `_TRADE_THRESHOLD` is never adopted or traded.
+- Validation: NaN weights, unknown columns, risk sum above 1, negative weights, inconsistent CASH, decision dates outside the price calendar and positive weights on unpriced risk assets all raise `ValueError`.
+
+### 4.12 `tests/test_telemetry_quality.py`
 
 - `TelemetryPayload` validators enforce `observation_date <= session_date <= asof`; `is_stale` compares the observation to the session, not the calendar.
 - Data gaps produce, in order, `non_session_asof`, `stale_observation`, `missing_feature`, `stale_input`, `dropped_symbol` warnings; clean sessions produce none.
+- `state_statistics` rejects duplicate regimes; `statistics_for(regime)` resolves by regime (`KeyError` when uncovered); payloads from `run_single_asof` and `latest_telemetry` carry the owning fold's statistics.
 
-**Total: 65 collected test cases** (the parametrized as-of fixture counts as 3).
+**Total: 84 collected test cases** (the parametrized as-of fixture counts as 3).
 
 ---
 
 ## 5. End-to-End Data Flow
 
 ```text
-[Provider] -> [PanelFetcher + cache] -> [align_panel]
+[Provider] -> [load_aligned_panel: PanelFetcher + cache (data.cache_dir) -> align_panel (data.calendar_anchor)]
     -> [build_feature_matrix]
     -> [run_walk_forward: fit / filter / backtest]
     -> [PipelineResult]

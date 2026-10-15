@@ -13,7 +13,7 @@ from regimelab.models.types import (
 )
 from regimelab.settings import Settings
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "MarketRegime",

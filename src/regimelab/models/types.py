@@ -35,6 +35,7 @@ __all__ = [
     "ModelMetadata",
     "RankingMethod",
     "RegimeProbabilities",
+    "RegimeStatistics",
     "TelemetryPayload",
     "regime_ladder",
 ]
@@ -126,9 +127,11 @@ class RankingMethod(StrEnum):
     """Strategy for ordering latent states from risk-on to risk-off."""
 
     SHARPE = "sharpe"
-    """Rank by ``mean_return / volatility``. The default: it blends both
-    dimensions, so a state with modest drift and very low volatility correctly
-    ranks above one with similar drift and crisis-level volatility."""
+    """Rank by ``mean_return / volatility``. It blends both dimensions, so a
+    state with modest drift and very low volatility correctly ranks above one
+    with similar drift and crisis-level volatility. Not the default for any
+    shipped classifier -- see :data:`DEFAULT_RANKING_METHODS` (``hmm`` and
+    ``hamilton`` use :attr:`STRESS`, ``gmm`` uses :attr:`VOLATILITY`)."""
 
     MEAN_RETURN = "mean_return"
     """Rank by conditional mean return alone. Cleaner to explain, but it cannot
@@ -344,6 +347,31 @@ class AllocationWeights(_Frozen):
         }
 
 
+class RegimeStatistics(_Frozen):
+    """Economic summary of one canonical regime, from a fitted assignment.
+
+    These describe the model's *training* window, not the period the payload
+    reports on: they are the moments of the return distribution conditional on
+    the state that ``regime`` was mapped from.
+    """
+
+    regime: MarketRegime
+    raw_state: Annotated[int, Field(ge=0)]
+    """Index of the latent state this regime was mapped from."""
+    occupancy: Annotated[float, Field(ge=0.0, le=1.0)]
+    """Share of the training sample assigned to the state."""
+    ann_return: float
+    """Posterior-weighted conditional mean return, annualised."""
+    ann_volatility: Annotated[float, Field(ge=0.0)]
+    """Posterior-weighted conditional volatility, annualised."""
+    sharpe: float
+    """``ann_return / ann_volatility``; ``0.0`` for a degenerate state."""
+    stress_score: float | None = None
+    """Signed stress score under STRESS ranking; ``None`` otherwise."""
+    n_observations: Annotated[int, Field(ge=0)]
+    """Effective observations assigned to the state."""
+
+
 class ModelMetadata(_Frozen):
     """Provenance of the classifier that produced a payload."""
 
@@ -395,6 +423,10 @@ class TelemetryPayload(_Frozen):
     features: FeatureSnapshot
     model: ModelMetadata
     target_weights: AllocationWeights | None = None
+    state_statistics: tuple[RegimeStatistics, ...] = ()
+    """Per-regime statistics of the signing model's training window --
+    ``model.train_start`` through ``model.train_end`` -- not of the live
+    window the payload reports on."""
     warnings: tuple[str, ...] = ()
 
     @property
@@ -438,3 +470,20 @@ class TelemetryPayload(_Frozen):
             msg = f"regime {self.regime} absent from the posterior distribution"
             raise ValueError(msg)
         return self
+
+    @model_validator(mode="after")
+    def _check_state_statistics_unique(self) -> Self:
+        regimes = [entry.regime for entry in self.state_statistics]
+        if len(set(regimes)) != len(regimes):
+            msg = "state_statistics contains duplicate regimes"
+            raise ValueError(msg)
+        return self
+
+    def statistics_for(self, regime: MarketRegime) -> RegimeStatistics:
+        """Statistics for ``regime``; raises when the payload has none."""
+        for entry in self.state_statistics:
+            if entry.regime is regime:
+                return entry
+        covered = [entry.regime.value for entry in self.state_statistics]
+        msg = f"no state statistics for {regime.value}; payload covers {covered}"
+        raise KeyError(msg)

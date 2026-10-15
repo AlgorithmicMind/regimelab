@@ -39,6 +39,16 @@ Most open-source regime detection scripts fit a Hidden Markov Model (HMM) on the
 
 ---
 
+## 🆕 What's new in 0.3.0
+
+- **Typed regime statistics**: `LabelAssignment.to_statistics()` returns `RegimeStatistics` per regime; `TelemetryPayload.state_statistics` and each `WalkForwardFold` carry them (`statistics_for(regime)` looks one up).
+- **`simulate_weights`**: the execution engine behind `run_backtest` is now public — backtest any hand-built weight schedule under the same signal-lag, rebalancing and cost assumptions.
+- **Leading low-confidence sessions sit in cash**: sessions before the first confident decision now earn the risk-free rate instead of a hard zero.
+- **Single data path**: the pipeline fetches through `load_aligned_panel` — cache in `data.cache_dir` within `data.cache_ttl_hours`, anchored on `data.calendar_anchor`; `force_refresh=True` bypasses the cache.
+- **Breaking for type consumers**: `BacktestResult.regimes` and `regime_metrics` are now optional (`None` when no regime path was supplied).
+
+See the [CHANGELOG](CHANGELOG.md) for the full list.
+
 ## 🆕 What's new in 0.2.0
 
 - **Causal walk-forward**: each fold labels only its own interval `(r_k, r_{k+1}]` with a model trained through `r_k` — no look-ahead, no overlapping labels.
@@ -122,6 +132,23 @@ metrics = result.backtest.metrics
 print(f"Strategy CAGR: {metrics.cagr:.2%}")
 print(f"Sharpe Ratio:  {metrics.sharpe:.2f}")
 print(f"Max Drawdown:  {metrics.max_drawdown:.2%}")
+```
+
+#### Backtest your own weights
+
+Any target-weight schedule — not only the regime map — can be simulated under
+the same execution assumptions (signal lag, event-driven rebalancing, costs):
+
+```python
+from regimelab.backtest import simulate_weights
+from regimelab.data.fetcher import load_aligned_panel
+
+prices = load_aligned_panel(settings).close()
+# A decision on day t is held from t + signal_lag_days until the next one;
+# CASH is the residual (here 0 — SPY/TLT are fully invested).
+targets = pd.DataFrame({"SPY": 0.6, "TLT": 0.4}, index=prices.index[::21])
+result = simulate_weights(prices, targets, settings)
+print(f"60/40 Sharpe: {result.metrics.sharpe:.2f}")
 ```
 
 ### 3. CLI & Terminal Dashboard

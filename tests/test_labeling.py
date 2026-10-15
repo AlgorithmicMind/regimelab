@@ -346,6 +346,59 @@ def test_describe_reports_stress_score() -> None:
     assert frame["stress_score"].notna().all()
 
 
+def test_to_statistics_is_ladder_ordered() -> None:
+    """``to_statistics()`` returns one entry per state, sorted by risk_rank."""
+    feature_names = ("trailing_return", "realised_vol", "vix_term_spread")
+    emission_means = np.array(
+        [
+            [0.5, -0.8, 0.7],  # state 0: calm profile
+            [-1.0, 1.5, -1.2],  # state 1: crisis profile
+            [0.0, 0.2, 0.0],  # state 2: transition profile
+        ]
+    )
+    stats = (
+        _make_stats(0, mean=0.10, vol=0.10, occupancy=0.5),
+        _make_stats(1, mean=-0.20, vol=0.40, occupancy=0.2),
+        _make_stats(2, mean=0.02, vol=0.15, occupancy=0.3),
+    )
+
+    assignment = assign_labels(
+        stats,
+        method=RankingMethod.STRESS,
+        emission_means=emission_means,
+        feature_names=feature_names,
+    )
+    entries = assignment.to_statistics()
+
+    # Mapping is bijective, so every ladder regime appears exactly once, in
+    # ladder order -- not in raw-state order (calm=0, transition=2, crisis=1).
+    assert [entry.regime for entry in entries] == list(regime_ladder(3))
+    assert [entry.raw_state for entry in entries] == [0, 2, 1]
+
+    crisis = entries[-1]
+    assert crisis.regime == MarketRegime.RISK_OFF
+    assert crisis.occupancy == pytest.approx(0.2)
+    assert crisis.ann_return == pytest.approx(-0.20)
+    assert crisis.ann_volatility == pytest.approx(0.40)
+    assert crisis.n_observations == 100
+    assert crisis.stress_score is not None
+
+    # describe() is built from to_statistics(): same rows, documented columns.
+    frame = assignment.describe()
+    assert list(frame.columns) == [
+        "regime",
+        "raw_state",
+        "occupancy",
+        "ann_return",
+        "ann_volatility",
+        "sharpe",
+        "stress_score",
+        "observations",
+    ]
+    assert list(frame["regime"]) == [r.value for r in regime_ladder(3)]
+    assert list(frame["raw_state"]) == [0, 2, 1]
+
+
 @pytest.fixture(scope="module")
 def synthetic_sample(test_settings: Settings) -> tuple[pd.DataFrame, pd.Series]:
     """Synthetic feature matrix and benchmark returns, built once per module."""

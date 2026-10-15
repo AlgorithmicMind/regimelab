@@ -189,10 +189,11 @@ class HTMLReport:
 
     def _regime_table(self) -> str:
         """Regime-conditional metrics table."""
-        if self._result.backtest is None:
+        backtest = self._result.backtest
+        if backtest is None or backtest.regime_metrics is None:
             return ""
 
-        df = self._result.backtest.regime_metrics.reset_index(drop=True)
+        df = backtest.regime_metrics.reset_index(drop=True)
         if df.empty:
             return ""
 

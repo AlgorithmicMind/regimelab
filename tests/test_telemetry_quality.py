@@ -28,6 +28,7 @@ from regimelab.models.types import (
     MarketRegime,
     ModelMetadata,
     RegimeProbabilities,
+    RegimeStatistics,
     TelemetryPayload,
 )
 from regimelab.pipeline import PipelineResult
@@ -53,6 +54,7 @@ def _payload(
     asof: dt.date,
     session_date: dt.date,
     observation_date: dt.date,
+    state_statistics: tuple[RegimeStatistics, ...] = (),
 ) -> TelemetryPayload:
     """A minimally valid payload for exercising the schema validators."""
     return TelemetryPayload(
@@ -60,6 +62,7 @@ def _payload(
         session_date=session_date,
         observation_date=observation_date,
         regime=MarketRegime.BULL_TREND,
+        state_statistics=state_statistics,
         probabilities=RegimeProbabilities(
             probabilities={
                 MarketRegime.BULL_TREND: 0.6,
@@ -112,7 +115,7 @@ def test_gap_produces_stale_observation_warnings(
     aligned = align_panel(raw, anchor=test_settings.data.benchmark)
     calendar = aligned.calendar
 
-    def _aligned(_settings: Settings) -> AlignedPanel:
+    def _aligned(_settings: Settings, **_kwargs: object) -> AlignedPanel:
         return aligned
 
     monkeypatch.setattr(pipeline, "_fetch_and_align", _aligned)
@@ -185,7 +188,7 @@ def test_non_session_asof_with_gap(
     calendar = aligned.calendar
     assert calendar[pos] == session
 
-    def _aligned(_settings: Settings) -> AlignedPanel:
+    def _aligned(_settings: Settings, **_kwargs: object) -> AlignedPanel:
         return aligned
 
     monkeypatch.setattr(pipeline, "_fetch_and_align", _aligned)
@@ -282,3 +285,79 @@ def test_latest_telemetry_reports_last_session(pipeline_result: PipelineResult) 
     assert payload.observation_date == expected
     assert payload.is_stale is False
     assert payload.warnings == ()
+
+
+def _statistics() -> tuple[RegimeStatistics, ...]:
+    """Two valid state-statistics entries on distinct regimes."""
+    return (
+        RegimeStatistics(
+            regime=MarketRegime.BULL_TREND,
+            raw_state=0,
+            occupancy=0.6,
+            ann_return=0.10,
+            ann_volatility=0.12,
+            sharpe=0.83,
+            n_observations=150,
+        ),
+        RegimeStatistics(
+            regime=MarketRegime.RISK_OFF,
+            raw_state=1,
+            occupancy=0.4,
+            ann_return=-0.20,
+            ann_volatility=0.35,
+            sharpe=-0.57,
+            n_observations=100,
+        ),
+    )
+
+
+def test_state_statistics_validator_and_lookup() -> None:
+    """Duplicate regimes are rejected; ``statistics_for`` resolves by regime."""
+    asof = dt.date(2020, 1, 10)
+    payload = _payload(
+        asof=asof,
+        session_date=asof,
+        observation_date=asof,
+        state_statistics=_statistics(),
+    )
+
+    assert payload.statistics_for(MarketRegime.RISK_OFF).raw_state == 1
+    with pytest.raises(KeyError, match="no state statistics for NEUTRAL_TRANSITION"):
+        payload.statistics_for(MarketRegime.NEUTRAL_TRANSITION)
+
+    duplicated = (*_statistics(), _statistics()[0].model_copy())
+    with pytest.raises(pydantic.ValidationError, match="duplicate regimes"):
+        _payload(
+            asof=asof,
+            session_date=asof,
+            observation_date=asof,
+            state_statistics=duplicated,
+        )
+
+
+def test_state_statistics_on_payloads(
+    test_settings: Settings,
+    pipeline_result: PipelineResult,
+) -> None:
+    """Telemetry carries the statistics of the model owning the observation."""
+    payload = pipeline.latest_telemetry(pipeline_result)
+
+    observed = payload.observation_date
+    fold = next(
+        f for f in pipeline_result.walkforward.folds if f.test_start <= observed <= f.test_end
+    )
+    # The payload is signed by the model of the fold that labelled the
+    # observation -- for the last session that is the last fold.
+    assert payload.model.train_end == fold.train_end
+    assert payload.state_statistics == fold.statistics
+    assert payload.statistics_for(payload.regime).regime == payload.regime
+
+    asof = pipeline_result.panel.calendar[-2].date()
+    single = pipeline.run_single_asof(test_settings, asof)
+    assert single.state_statistics
+    assert [s.regime for s in single.state_statistics] == sorted(
+        (s.regime for s in single.state_statistics), key=lambda r: r.risk_rank
+    )
+    # A 3-state ladder has no HIGH_VOL_BEAR entry.
+    with pytest.raises(KeyError, match="no state statistics"):
+        single.statistics_for(MarketRegime.HIGH_VOL_BEAR)

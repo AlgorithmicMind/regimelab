@@ -46,7 +46,7 @@ turnover slightly, because a real portfolio drifts and needs topping up.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -64,7 +64,13 @@ from regimelab.models.types import AllocationWeights, MarketRegime, regime_ladde
 if TYPE_CHECKING:
     from regimelab.settings import BacktestSettings, Settings
 
-__all__ = ["CASH_COLUMN", "BacktestResult", "run_backtest", "target_weight_frame"]
+__all__ = [
+    "CASH_COLUMN",
+    "BacktestResult",
+    "run_backtest",
+    "simulate_weights",
+    "target_weight_frame",
+]
 
 CASH_COLUMN = "CASH"
 """Column name for the unallocated fraction."""
@@ -72,6 +78,10 @@ CASH_COLUMN = "CASH"
 # Weight changes below this threshold are treated as noise and not traded, so
 # floating-point residue in the allocation table cannot manufacture turnover.
 _TRADE_THRESHOLD = 1e-9
+
+# Validation tolerance for supplied weights: bookkeeping residue, not
+# economics. Anything beyond this is a real allocation error.
+_WEIGHT_TOLERANCE = 1e-9
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +92,8 @@ class BacktestResult:
     ----------
     regimes
         Regime in force on each session, as observed at the decision time.
+        ``None`` when the backtest simulated a supplied weight path rather
+        than a regime signal.
     target_weights
         Weights the regime implies on each session, before lag and schedule.
     held_weights
@@ -102,10 +114,11 @@ class BacktestResult:
         Statistics for the strategy and for buy-and-hold.
     regime_metrics
         Benchmark return statistics conditioned on regime -- the diagnostic that
-        shows whether the classifier separated anything.
+        shows whether the classifier separated anything. ``None`` without a
+        regime path.
     """
 
-    regimes: pd.Series
+    regimes: pd.Series | None
     target_weights: pd.DataFrame
     held_weights: pd.DataFrame
     gross_returns: pd.Series
@@ -117,7 +130,7 @@ class BacktestResult:
     benchmark_equity: pd.Series
     metrics: PerformanceMetrics
     benchmark_metrics: PerformanceMetrics
-    regime_metrics: pd.DataFrame
+    regime_metrics: pd.DataFrame | None
 
     @property
     def drawdown(self) -> pd.Series:
@@ -151,7 +164,6 @@ class BacktestResult:
         """Session-level audit trail, suitable for persisting as Parquet."""
         frame = pd.DataFrame(
             {
-                "regime": self.regimes.map(lambda r: getattr(r, "value", r)),
                 "gross_return": self.gross_returns,
                 "net_return": self.net_returns,
                 "traded_notional": self.traded_notional,
@@ -162,6 +174,12 @@ class BacktestResult:
                 "drawdown": self.drawdown,
             },
         )
+        if self.regimes is not None:
+            frame.insert(
+                0,
+                "regime",
+                self.regimes.map(lambda r: getattr(r, "value", r)),
+            )
         weights = self.held_weights.add_prefix("w_")
         return frame.join(weights)
 
@@ -218,44 +236,144 @@ def target_weight_frame(
     return frame.astype("float64")
 
 
-def run_backtest(
+def _validated_weight_frame(
+    target_weights: pd.DataFrame,
     prices: pd.DataFrame,
-    regimes: pd.Series,
+    settings: Settings,
+) -> pd.DataFrame:
+    """Validate a decision frame and normalise it to ``[*investable, CASH]``.
+
+    Raises ``ValueError`` on any inconsistency: NaN weights, columns outside
+    ``risk_assets`` plus ``CASH``, a positive weight on an unpriced risk asset,
+    weights outside ``[0, 1]``, a risk sum above 1, a CASH column that is not
+    the residual, or decision dates outside the price calendar. All
+    comparisons tolerate ``_WEIGHT_TOLERANCE`` of bookkeeping residue.
+    """
+    if target_weights.isna().any(axis=None):
+        msg = "target_weights contains NaN weights"
+        raise ValueError(msg)
+
+    allowed = {str(s) for s in settings.data.risk_assets} | {CASH_COLUMN}
+    unknown = [str(c) for c in target_weights.columns if str(c) not in allowed]
+    if unknown:
+        msg = (
+            f"target_weights columns {unknown} are not in risk_assets "
+            f"{list(settings.data.risk_assets)} or {CASH_COLUMN}"
+        )
+        raise ValueError(msg)
+
+    unpriced = [
+        c for c in target_weights.columns if str(c) != CASH_COLUMN and c not in prices.columns
+    ]
+    positive_unpriced = [c for c in unpriced if (target_weights[c] > _WEIGHT_TOLERANCE).any()]
+    if positive_unpriced:
+        msg = f"target_weights assigns positive weight to {positive_unpriced}, which have no prices"
+        raise ValueError(msg)
+
+    extra_dates = target_weights.index.difference(prices.index)
+    if len(extra_dates):
+        msg = (
+            "target_weights has decision dates outside the price calendar, "
+            f"e.g. {[d.date().isoformat() for d in extra_dates[:5]]}"
+        )
+        raise ValueError(msg)
+
+    risk_columns = [c for c in target_weights.columns if str(c) != CASH_COLUMN]
+    risk = target_weights.loc[:, risk_columns]
+    if (risk < -_WEIGHT_TOLERANCE).any(axis=None) or (risk > 1.0 + _WEIGHT_TOLERANCE).any(
+        axis=None
+    ):
+        msg = "target weights must lie in [0, 1]"
+        raise ValueError(msg)
+    risk_sum = (
+        risk.sum(axis="columns") if risk_columns else pd.Series(0.0, index=target_weights.index)
+    )
+    if (risk_sum > 1.0 + _WEIGHT_TOLERANCE).any():
+        msg = "risk weights sum above 1.0"
+        raise ValueError(msg)
+
+    # The investable columns are the configured risk assets that are priced;
+    # missing ones mean zero exposure.
+    investable = [s for s in settings.data.risk_assets if s in prices.columns]
+    aligned = target_weights.reindex(columns=[*investable, CASH_COLUMN])
+    if CASH_COLUMN in target_weights.columns:
+        residual = 1.0 - risk_sum
+        if (aligned[CASH_COLUMN] - residual).abs().gt(_WEIGHT_TOLERANCE).any():
+            msg = "CASH column must equal 1 - sum(risk weights)"
+            raise ValueError(msg)
+    else:
+        aligned[CASH_COLUMN] = (1.0 - risk_sum).clip(lower=0.0)
+    aligned.loc[:, investable] = aligned.loc[:, investable].fillna(0.0)
+    return aligned
+
+
+def _adopted_schedule(targets: pd.DataFrame) -> pd.DataFrame:
+    """Collapse a target path into the sequence actually adopted.
+
+    A new target replaces the adopted one only when it differs by more than
+    ``_TRADE_THRESHOLD`` -- measured against the last *adopted* row, not the
+    previous raw row, so a sequence of sub-threshold drifts cannot accumulate
+    into a real change.
+    """
+    matrix = targets.to_numpy(dtype="float64")
+    adopted_rows = np.empty_like(matrix)
+    adopted = matrix[0].copy()
+    for i in range(matrix.shape[0]):
+        if np.abs(matrix[i] - adopted).max() > _TRADE_THRESHOLD:
+            adopted = matrix[i].copy()
+        adopted_rows[i] = adopted
+    return pd.DataFrame(adopted_rows, index=targets.index, columns=targets.columns)
+
+
+def simulate_weights(
+    prices: pd.DataFrame,
+    target_weights: pd.DataFrame,
     settings: Settings,
     *,
-    confidence: pd.Series | None = None,
     start: dt.date | None = None,
+    regimes: pd.Series | None = None,
 ) -> BacktestResult:
-    """Run the regime-conditional allocation backtest.
+    """Simulate holding a hand-supplied target-weight schedule.
+
+    This is the engine behind :func:`run_backtest`, exposed so that any
+    allocation policy -- not only the regime map -- can be evaluated under the
+    same execution assumptions: signal lag, event-driven rebalancing,
+    transaction costs, and a cash sleeve earning the risk-free rate.
 
     Parameters
     ----------
     prices
         Closing prices, dates by symbols. Must include the benchmark.
-    regimes
-        Regime label per session, as inferred causally. Reindexed onto the price
-        calendar and forward-filled: a regime observed at ``t`` remains in force
-        until a new observation, which is causal.
+    target_weights
+        Decision frame: one row per decision date, one column per risk asset
+        plus an optional :data:`CASH_COLUMN`. Columns must be a subset of
+        ``settings.data.risk_assets`` plus CASH; missing investable columns
+        are filled with zero. A positive weight on a symbol absent from
+        ``prices`` is rejected. Every weight must lie in ``[0, 1]`` and the
+        risk weights may not sum above 1 (within ``_WEIGHT_TOLERANCE``). A
+        CASH column, when present, must equal ``1 - sum(risk weights)``; when
+        absent it is computed as ``max(0, 1 - sum)``. Every decision date must
+        be a session in ``prices.index``.
     settings
         Resolved configuration.
-    confidence
-        Modal posterior confidence per session, in ``[0, 1]``. Below
-        ``settings.backtest.confidence_floor`` the previous allocation is
-        retained.
     start
         Optional first evaluated session, used to exclude the warm-up span.
+    regimes
+        Optional regime path, aligned the same way as ``target_weights``. When
+        given, the result carries it and regime-conditional benchmark metrics.
 
     Returns
     -------
     BacktestResult
-        Full result, including the benchmark comparison.
+        ``target_weights`` holds the aligned input schedule; ``regimes`` and
+        ``regime_metrics`` are ``None`` unless ``regimes`` was supplied.
 
     Raises
     ------
     ValueError
-        If the benchmark is absent or no session survives alignment.
+        On any invalid input described above, or when fewer than two sessions
+        survive alignment.
     """
-
     backtest_cfg = settings.backtest
     benchmark = settings.data.benchmark
 
@@ -264,37 +382,25 @@ def run_backtest(
         raise ValueError(msg)
 
     investable = [s for s in settings.data.risk_assets if s in prices.columns]
-    asset_returns = prices.loc[:, investable].pct_change()
+    aligned = _validated_weight_frame(target_weights, prices, settings)
 
-    aligned_regimes = regimes.reindex(prices.index).ffill()
-    usable = aligned_regimes.dropna().index
+    # A decision taken at t holds until the next one; that is causal.
+    aligned = aligned.reindex(prices.index).ffill()
+    usable = aligned.index[aligned.notna().all(axis="columns")]
     if start is not None:
         usable = usable[usable >= pd.Timestamp(start)]
-
     if len(usable) < 2:
-        msg = "backtest requires at least 2 sessions with a known regime"
+        msg = "backtest requires at least 2 sessions with a target weight"
         raise ValueError(msg)
 
-    aligned_regimes = aligned_regimes.loc[usable]
-    asset_returns = asset_returns.loc[usable]
+    aligned = aligned.loc[usable]
+    asset_returns = prices.loc[:, investable].pct_change().loc[usable]
 
-    targets = target_weight_frame(aligned_regimes, backtest_cfg, investable)
+    # Event-driven rebalancing: adopt a new target only when it departs from
+    # the last adopted one by more than the trade threshold.
+    scheduled = _adopted_schedule(aligned)
 
-    # Event-driven rebalancing: the target changes only when the regime changes.
-    # The raw target series would have a new value every session even when the
-    # regime has not changed; this mask holds the previous target whenever the
-    # inferred regime is unchanged.
-    regime_changed = aligned_regimes.ne(aligned_regimes.shift()).fillna(True)
-    scheduled = targets.where(regime_changed, other=np.nan).ffill().astype("float64")
-
-    # Apply the confidence floor. When the classifier is unsure, its modal
-    # posterior is low and the risk of acting on noise is highest; in those
-    # sessions the previous allocation is held.
-    if confidence is not None and backtest_cfg.confidence_floor > 0.0:
-        aligned_conf = confidence.reindex(prices.index).reindex(usable)
-        confident = aligned_conf.ge(backtest_cfg.confidence_floor).fillna(True)
-        scheduled = scheduled.where(confident, other=np.nan).ffill().astype("float64")
-
+    # --- From here on, identical mechanics to the historical engine -------
     # Signal lag. The scheduled weight at t is decided on information as of
     # t - signal_lag_days and is held on t.
     held = scheduled.shift(backtest_cfg.signal_lag_days)
@@ -341,16 +447,20 @@ def run_backtest(
         risk_free_rate=backtest_cfg.risk_free_rate,
     )
 
-    conditional = regime_conditional_metrics(
-        benchmark_returns,
-        aligned_regimes,
-        trading_days=settings.features.trading_days_per_year,
-        order=list(regime_ladder(settings.model.n_states)),
-    )
+    aligned_regimes = None
+    conditional = None
+    if regimes is not None:
+        aligned_regimes = regimes.reindex(prices.index).ffill().loc[usable].rename("regime")
+        conditional = regime_conditional_metrics(
+            benchmark_returns,
+            aligned_regimes,
+            trading_days=settings.features.trading_days_per_year,
+            order=list(regime_ladder(settings.model.n_states)),
+        )
 
     return BacktestResult(
-        regimes=aligned_regimes.rename("regime"),
-        target_weights=targets,
+        regimes=aligned_regimes,
+        target_weights=aligned,
         held_weights=held,
         gross_returns=gross_returns,
         net_returns=net_returns,
@@ -363,3 +473,94 @@ def run_backtest(
         benchmark_metrics=benchmark_metrics,
         regime_metrics=conditional,
     )
+
+
+def run_backtest(
+    prices: pd.DataFrame,
+    regimes: pd.Series,
+    settings: Settings,
+    *,
+    confidence: pd.Series | None = None,
+    start: dt.date | None = None,
+) -> BacktestResult:
+    """Run the regime-conditional allocation backtest.
+
+    Parameters
+    ----------
+    prices
+        Closing prices, dates by symbols. Must include the benchmark.
+    regimes
+        Regime label per session, as inferred causally. Reindexed onto the price
+        calendar and forward-filled: a regime observed at ``t`` remains in force
+        until a new observation, which is causal.
+    settings
+        Resolved configuration.
+    confidence
+        Modal posterior confidence per session, in ``[0, 1]``. Below
+        ``settings.backtest.confidence_floor`` the previous allocation is
+        retained.
+    start
+        Optional first evaluated session, used to exclude the warm-up span.
+
+    Returns
+    -------
+    BacktestResult
+        Full result, including the benchmark comparison.
+
+    Raises
+    ------
+    ValueError
+        If the benchmark is absent or no session survives alignment.
+    """
+
+    backtest_cfg = settings.backtest
+    benchmark = settings.data.benchmark
+
+    if benchmark not in prices.columns:
+        msg = f"benchmark {benchmark!r} absent from the price frame"
+        raise ValueError(msg)
+
+    investable = [s for s in settings.data.risk_assets if s in prices.columns]
+
+    aligned_regimes = regimes.reindex(prices.index).ffill()
+    usable = aligned_regimes.dropna().index
+    if start is not None:
+        usable = usable[usable >= pd.Timestamp(start)]
+
+    if len(usable) < 2:
+        msg = "backtest requires at least 2 sessions with a known regime"
+        raise ValueError(msg)
+
+    aligned_regimes = aligned_regimes.loc[usable]
+
+    targets = target_weight_frame(aligned_regimes, backtest_cfg, investable)
+
+    # Event-driven rebalancing: the target changes only when the regime changes.
+    # The raw target series would have a new value every session even when the
+    # regime has not changed; this mask holds the previous target whenever the
+    # inferred regime is unchanged.
+    regime_changed = aligned_regimes.ne(aligned_regimes.shift()).fillna(True)
+    scheduled = targets.where(regime_changed, other=np.nan).ffill().astype("float64")
+
+    # Apply the confidence floor. When the classifier is unsure, its modal
+    # posterior is low and the risk of acting on noise is highest; in those
+    # sessions the previous allocation is held.
+    if confidence is not None and backtest_cfg.confidence_floor > 0.0:
+        aligned_conf = confidence.reindex(prices.index).reindex(usable)
+        confident = aligned_conf.ge(backtest_cfg.confidence_floor).fillna(True)
+        scheduled = scheduled.where(confident, other=np.nan).ffill().astype("float64")
+
+    # The confidence floor can blank the first decision rows, leaving a
+    # leading all-NaN span. The documented stance for that span is 100% cash,
+    # so fill it -- otherwise those sessions would hold zero weights and earn
+    # nothing instead of the risk-free rate.
+    first_valid = scheduled.first_valid_index()
+    leading = (
+        scheduled.index if first_valid is None else scheduled.index[scheduled.index < first_valid]
+    )
+    if len(leading):
+        scheduled.loc[leading, :] = 0.0
+        scheduled.loc[leading, CASH_COLUMN] = 1.0
+
+    result = simulate_weights(prices, scheduled, settings, regimes=aligned_regimes)
+    return replace(result, target_weights=targets)

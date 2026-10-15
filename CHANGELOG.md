@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 — 2026-10-20
+
+- `RegimeStatistics`: `LabelAssignment.to_statistics()` exposes per-regime training-window statistics; `TelemetryPayload.state_statistics` carries them and `statistics_for(regime)` looks them up by regime
+- `LabelAssignment.describe()` rows are now in ladder order (risk-on to risk-off), not raw-state order
+- `WalkForwardFold.statistics` holds the fold model's per-regime statistics
+- `latest_telemetry` signs the payload with the model and statistics of the fold whose `[test_start, test_end]` contains `observation_date`, instead of always the last fold
+- `simulate_weights` simulates any hand-supplied target-weight schedule under the same execution assumptions; `run_backtest` is reimplemented on it with numerically identical output (golden regression test)
+- Breaking: `BacktestResult.regimes` and `regime_metrics` are optional (`None` when a weight path rather than a regime signal was simulated) — a breaking change for type consumers
+- Fix: leading sessions whose confidence is below the floor now hold 100% CASH and earn the risk-free rate, instead of holding zero weights and earning nothing
+- Breaking: the pipeline data path goes through `load_aligned_panel` — the panel cache moves from `artifacts_dir/cache` to `data.cache_dir`, panels are reused within `data.cache_ttl_hours` (the TTL is no longer forced to 0) and alignment anchors on `data.calendar_anchor`; `force_refresh=True` restores always-refetch
+- `RankingMethod.SHARPE` docstring now states it is no longer any classifier's default (`hmm`/`hamilton` → `STRESS`, `gmm` → `VOLATILITY`; see `DEFAULT_RANKING_METHODS`)
+
 ## 0.2.0 — 2026-10-07
 
 - Official CBOE/FRED sourcing for ^VIX and ^VIX3M with provider fallback

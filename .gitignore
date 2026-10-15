@@ -13,6 +13,7 @@ wheels/
 artifacts/
 .artifacts/
 *.parquet
+!tests/data/*.parquet
 .test-artifacts/
 *.html
 scratch_*.py

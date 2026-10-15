@@ -32,6 +32,7 @@ from regimelab.models.types import (
     MarketRegime,
     ModelMetadata,
     RegimeProbabilities,
+    RegimeStatistics,
     TelemetryPayload,
     regime_ladder,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "RankingMethod",
     "RegimeModel",
     "RegimeProbabilities",
+    "RegimeStatistics",
     "StateEstimate",
     "StateStatistics",
     "TelemetryPayload",
