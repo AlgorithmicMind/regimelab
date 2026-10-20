@@ -455,8 +455,12 @@ class TelemetryPayload(_Frozen):
 
     @property
     def is_stale(self) -> bool:
-        """Whether the posterior was computed on data older than the latest
-        session -- a data problem, not a calendar one."""
+        """Whether the posterior predates the latest session in the supplied panel.
+
+        False does not establish wall-clock freshness: the panel itself may
+        lack an expected exchange session. Check dates and warnings against
+        the consumer's exchange calendar before publishing.
+        """
         return self.observation_date < self.session_date
 
     @model_validator(mode="after")

@@ -39,6 +39,15 @@ Most open-source regime detection scripts fit a Hidden Markov Model (HMM) on the
 
 ---
 
+## 🆕 What's new in 0.4.0
+
+- `simulate_next_open` / `NextOpenResult`: an opt-in position ledger with opening fills, actual unit drift, self-financing costs, observation masks and publication ordering.
+- The legacy overlay keeps valid-input outputs but now rejects unavailable prices needed for a held return or benchmark.
+- Warning migration: replace consumers of `non_session_asof` with `asof_not_in_panel`. This means absent panel coverage, not a confirmed market closure. Check an exchange calendar for publication eligibility; `is_stale=False` alone does not establish freshness.
+- Selected-restart HMM convergence metadata and opt-in initial-equity drawdowns are corrected without changing legacy metric defaults.
+
+See [the execution contract](docs/next_open_execution.md) and [CHANGELOG](CHANGELOG.md) for conventions and compatibility.
+
 ## 🆕 What's new in 0.3.0
 
 - **Typed regime statistics**: `LabelAssignment.to_statistics()` returns `RegimeStatistics` per regime; `TelemetryPayload.state_statistics` and each `WalkForwardFold` carry them (`statistics_for(regime)` looks one up).
@@ -65,12 +74,14 @@ See the [CHANGELOG](CHANGELOG.md) for the full list.
 ### 1. Installation
 
 ```bash
-# Install from PyPI
+# Install the latest version available on PyPI
 pip install regimelab
 
 # Or install with interactive TUI support
 pip install "regimelab[tui]"
 ```
+
+Tagged wheels and source archives are also available on [GitHub Releases](https://github.com/AlgorithmicMind/regimelab/releases). GitHub and PyPI are published separately; if a version is not on PyPI yet, download its wheel and install it with `pip install path/to/wheel.whl`.
 
 ### 2. Python API Usage
 
@@ -150,6 +161,56 @@ targets = pd.DataFrame({"SPY": 0.6, "TLT": 0.4}, index=prices.index[::21])
 result = simulate_weights(prices, targets, settings)
 print(f"60/40 Sharpe: {result.metrics.sharpe:.2f}")
 ```
+
+This is the legacy close-only overlay: it retains its integer-lag,
+constant-weight and cash-inclusive-turnover conventions. It is not an opening
+fill simulator. Its numerical outputs for valid inputs remain unchanged for
+compatibility.
+
+#### Next-open position ledger (0.4.0)
+
+`simulate_next_open` retains actual adjusted units between instructions, pays
+costs on risky buys/sells (not cash transfers), and requires a caller-supplied
+exchange schedule. It is included in 0.4.0, not in 0.3.0.
+
+This fully offline example buys at 103 after the previous close of 100. It
+earns only the subsequent move from 103 to 104, not the overnight gap:
+
+```python
+import pandas as pd
+from regimelab import Settings
+from regimelab.backtest import simulate_next_open
+
+dates = pd.date_range("2024-01-02", periods=3)
+closes = pd.DataFrame({"SPY": [100.0, 104.0, 104.0]}, index=dates)
+opens = pd.DataFrame({"SPY": [100.0, 103.0, 104.0]}, index=dates)
+sessions = pd.DataFrame({
+    "market_open": (dates + pd.Timedelta(hours=9, minutes=30)).tz_localize("America/New_York"),
+    "market_close": (dates + pd.Timedelta(hours=16)).tz_localize("America/New_York"),
+}, index=dates)
+settings = Settings(
+    _env_file=None,
+    data={"risk_assets": ("SPY",)},
+    backtest={"regime_weights": {}, "initial_capital": 1000.0,
+              "transaction_cost_bps": 0.0, "risk_free_rate": 0.0},
+)
+targets = pd.DataFrame({"SPY": [1.0]}, index=dates[:1])
+result = simulate_next_open(
+    closes, targets, settings, open_prices=opens, sessions=sessions
+)
+print(result.net_returns.iloc[0])  # 1 / 103, approximately 0.00970874
+print(result.to_frame())          # units, cash, fees, timing and opening/closing weights
+```
+
+Without `published_at`, availability at the decision close is an explicit
+research assumption. Supply actual timezone-aware publication timestamps for
+an observed record. Instructions at/after an opening cannot receive an earlier
+fill; an older delayed observation cannot override a newer one.
+Use genuinely observed, consistently adjusted OHLC and the optional
+`open_observed` / `close_observed` provenance masks. The library does not infer
+freshness from a finite carried price or guarantee subscriber auction fills.
+See [the execution specification](docs/next_open_execution.md) for cash accrual,
+self-financing costs, benchmark treatment and compatibility boundaries.
 
 ### 3. CLI & Terminal Dashboard
 

@@ -60,9 +60,24 @@ def equity_curve(returns: pd.Series, initial: float = 1.0) -> pd.Series:
     return initial * (1.0 + clean).cumprod()
 
 
-def drawdown_series(equity: pd.Series) -> pd.Series:
-    """Drawdown from the running peak, as a non-positive fraction."""
+def drawdown_series(equity: pd.Series, *, initial: float | None = None) -> pd.Series:
+    """Drawdown from the running peak, as a non-positive fraction.
+
+    Parameters
+    ----------
+    equity
+        Equity curve.
+    initial
+        Optional starting capital included in the peak baseline: a curve that
+        opens below it already reads as a drawdown. ``None`` (the default)
+        keeps the legacy behaviour of measuring peaks from the curve alone.
+    """
     peak = equity.cummax()
+    if initial is not None:
+        if not (np.isfinite(initial) and initial > 0):
+            msg = "initial equity must be finite and positive"
+            raise ValueError(msg)
+        peak = peak.clip(lower=initial)
     return (equity / peak - 1.0).rename("drawdown")
 
 
@@ -162,6 +177,7 @@ def compute_metrics(
     weights: pd.DataFrame | None = None,
     turnover: pd.Series | None = None,
     costs: pd.Series | None = None,
+    initial_equity: float | None = None,
 ) -> PerformanceMetrics:
     """Compute the full statistics block for a net return series.
 
@@ -179,12 +195,20 @@ def compute_metrics(
         Per-session one-way turnover, for the turnover statistic.
     costs
         Per-session transaction cost as a fraction of capital.
+    initial_equity
+        Optional starting capital counted in the drawdown peak baseline, so an
+        opening loss reads as a drawdown. ``None`` (the default) keeps the
+        legacy metrics unchanged.
 
     Returns
     -------
     PerformanceMetrics
         Validated statistics block.
     """
+    if initial_equity is not None and not (np.isfinite(initial_equity) and initial_equity > 0):
+        msg = "initial equity must be finite and positive"
+        raise ValueError(msg)
+
     clean = returns.dropna().astype("float64")
 
     if clean.empty:
@@ -228,7 +252,7 @@ def compute_metrics(
     downside_dev = float(np.sqrt(np.mean(downside**2)))
     sortino = mean_excess / downside_dev * np.sqrt(trading_days) if downside_dev > _EPSILON else 0.0
 
-    drawdown = drawdown_series(equity)
+    drawdown = drawdown_series(equity, initial=initial_equity)
     max_drawdown = float(drawdown.min())
     calmar = cagr / abs(max_drawdown) if abs(max_drawdown) > _EPSILON else 0.0
 

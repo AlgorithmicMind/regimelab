@@ -115,8 +115,8 @@ def _data_quality_warnings(
 ) -> tuple[str, ...]:
     """Describe, never repair, the gap between the request and the data.
 
-    Degradations are reported in a fixed order: a requested date that is not
-    a trading session, a posterior computed on an older session, model
+    Degradations are reported in a fixed order: a requested date absent from
+    the supplied panel, a posterior computed on an older supplied session, model
     features unavailable at the as-of date, inputs carried forward by the
     staleness budget, and symbols dropped for having no usable history at all.
     """
@@ -124,8 +124,9 @@ def _data_quality_warnings(
 
     if session_date < asof:
         message = (
-            f"non_session_asof: requested asof {asof.isoformat()} is not a "
-            f"trading session; last session {session_date.isoformat()}"
+            f"asof_not_in_panel: requested asof {asof.isoformat()} is not present "
+            f"in the provided panel; last available session {session_date.isoformat()}; "
+            "verify an exchange calendar to distinguish market closure from unavailable data"
         )
         warnings.append(message)
 

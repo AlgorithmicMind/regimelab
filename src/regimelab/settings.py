@@ -295,11 +295,11 @@ class BacktestSettings(_Section):
     """Point-in-time simulation parameters."""
 
     signal_lag_days: Annotated[int, Field(ge=1)] = 1
-    """Sessions between observing a regime and trading on it.
+    """Session shift of targets in the legacy close-to-close overlay.
 
-    Must be at least 1. A regime inferred from session ``t``'s close cannot be
-    traded at session ``t``'s close; a zero lag is the single most common source
-    of fictitious alpha in published regime research.
+    Shift one applies a close-D decision to the close-D to close-D+1 return,
+    not a realizable fill after observing close D. Use ``simulate_next_open``
+    for an explicit opening-fill ledger; that API requires this value to be 1.
     """
 
     refit_frequency_days: Annotated[int, Field(ge=1)] = 21
@@ -307,7 +307,12 @@ class BacktestSettings(_Section):
     parameters are frozen and only the filter is advanced."""
 
     transaction_cost_bps: Annotated[float, Field(ge=0.0)] = 5.0
-    """Round-trip cost per unit of turnover, in basis points."""
+    """Basis-point charge on the chosen engine's traded-notional convention.
+
+    The legacy overlay includes CASH weight changes; ``simulate_next_open``
+    charges actual risky buys/sells only. This is a cost assumption, not an
+    empirical broker spread or a separate additional slippage model.
+    """
 
     initial_capital: Annotated[float, Field(gt=0.0)] = 1_000_000.0
 

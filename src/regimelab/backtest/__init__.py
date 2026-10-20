@@ -16,6 +16,7 @@ from regimelab.backtest.metrics import (
     equity_curve,
     regime_conditional_metrics,
 )
+from regimelab.backtest.portfolio import NextOpenResult, simulate_next_open
 from regimelab.backtest.walkforward import (
     WalkForwardFold,
     WalkForwardResult,
@@ -25,6 +26,7 @@ from regimelab.backtest.walkforward import (
 __all__ = [
     "CASH_COLUMN",
     "BacktestResult",
+    "NextOpenResult",
     "PerformanceMetrics",
     "WalkForwardFold",
     "WalkForwardResult",
@@ -34,6 +36,7 @@ __all__ = [
     "regime_conditional_metrics",
     "run_backtest",
     "run_walk_forward",
+    "simulate_next_open",
     "simulate_weights",
     "target_weight_frame",
 ]

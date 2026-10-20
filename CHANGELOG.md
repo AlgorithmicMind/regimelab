@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 — 2026-10-20
+
+- Fix: HMM convergence metadata describes the selected highest-likelihood restart, not whether any restart converged. Model selection and fitted numerical parameters are unchanged.
+- Added: `simulate_next_open` and `NextOpenResult`, an explicit next-open position ledger with publication ordering, observation masks, actual unit drift, self-financing per-risky-leg costs and an identically accounted benchmark. The legacy overlay and pipeline defaults remain unchanged.
+- Added: optional initial-equity baselines for drawdown/Calmar; their default `None` preserves legacy metrics. The new ledger includes inception losses relative to capital.
+- The API/accounting contract and assumptions are documented in `docs/next_open_execution.md`; next-open execution remains opt-in and the default pipeline, model settings and historical start date remain unchanged.
+- Fix: the legacy overlay rejects missing, nonfinite or nonpositive closes needed for an exposed return or its benchmark instead of silently reporting zero/skipping dates. Valid-input golden outputs are preserved; only the first benchmark interval may lack a preceding input observation.
+- Breaking warning-code change: `non_session_asof` is replaced by `asof_not_in_panel`. Missing panel coverage is not inferred to be a market holiday; `is_stale` still compares the posterior date with the last supplied session, not the expected exchange calendar.
+
 ## 0.3.0 — 2026-10-20
 
 - `RegimeStatistics`: `LabelAssignment.to_statistics()` exposes per-regime training-window statistics — one entry per regime, so states sharing a regime (the positive-drift guardrail under VOLATILITY/SHARPE) are combined with occupancy-weighted moments, mirroring how `relabel_probabilities` sums their posteriors; `raw_states: tuple[int, ...]` lists every member state, and `ann_return`/`ann_volatility`/`sharpe` are `None` for a regime without weight. `TelemetryPayload.state_statistics` carries them and `statistics_for(regime)` looks them up by regime

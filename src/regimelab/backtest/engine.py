@@ -9,25 +9,21 @@ is optimised -- the regime weights are fixed by configuration and never fitted.
 That is deliberate. Optimised weights would make the results a statement about
 the optimiser rather than about the regime signal.
 
-Execution assumptions, all conservative
----------------------------------------
-- **Signal lag.** A regime inferred from the close of session ``t`` is acted on
-  at the close of ``t + signal_lag_days``, default one session. Trading at the
-  same close that produced the signal is the most common way a backtest becomes
-  untradeable, and it typically accounts for a large share of the apparent edge
-  in published regime strategies.
-- **Rebalancing is event-driven, not calendar-driven.** Weights change only when
-  the regime changes. This is what a regime overlay actually does, and it avoids
-  imposing an arbitrary monthly or weekly grid that would blur the very timing
-  the signal is being judged on. It also means turnover is an *output* of the
-  classifier's stability rather than a parameter to be tuned -- a noisy
-  classifier is charged for its noise.
-- **Costs.** ``transaction_cost_bps`` is charged on gross traded notional every
-  time weights move. There is no bid-ask model, no market impact and no
-  slippage, so realised costs would be *higher* than reported, not lower.
-- **Cash.** The unallocated fraction earns the configured risk-free rate. Not
-  crediting it would overstate the benefit of de-risking; crediting a rate the
-  strategy could not obtain would understate the cost.
+Legacy overlay assumptions
+--------------------------
+- **Signal shift, not an execution timestamp.** The weight used for the return
+  ending at session ``t`` comes from ``t - signal_lag_days``. Thus shift one
+  applies a close-D decision to the return from close D to close D+1. It does
+  not establish a realizable fill after observing close D. For an explicit
+  next-opening position ledger use ``simulate_next_open`` instead.
+- **Event-driven targets.** ``run_backtest`` translates regime changes into
+  targets; ``simulate_weights`` adopts changed weight vectors. Neither models
+  physical units drifting between rebalance instructions.
+- **Costs.** The historical turnover convention includes absolute changes in
+  risky weights and the residual CASH column. ``transaction_cost_bps`` is
+  multiplied by that convention; it is not an observed broker execution cost.
+- **Cash.** The unallocated fraction earns the configured constant cash rate.
+  This is an assumption, not evidence of a yield obtainable throughout history.
 - **Confidence floor.** When the modal posterior is below
   ``confidence_floor`` the previous allocation is retained rather than acting on
   an ambiguous read. This suppresses churn around regime boundaries, which is
@@ -37,10 +33,12 @@ Execution assumptions, all conservative
 
 Known limitations
 -----------------
-Positions are assumed rebalanced exactly to target whenever the regime changes,
-with no intra-period drift between those events. For liquid ETFs held over
-multi-week regimes this is a small approximation, but it is not free: it flatters
-turnover slightly, because a real portfolio drifts and needs topping up.
+Weights remain constant between changes, implying unpriced maintenance of the
+mix. This is not a self-financing buy-and-hold ledger and no bound on its
+performance/cost approximation is claimed. Valid-input legacy outputs are
+retained for comparison. Missing prices needed for an exposed return or the
+benchmark are errors; only unused assets and the benchmark's first interval
+without a preceding input observation may have undefined returns.
 """
 
 from __future__ import annotations
@@ -51,6 +49,7 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 
 from regimelab.backtest.metrics import (
     PerformanceMetrics,
@@ -97,8 +96,8 @@ class BacktestResult:
     target_weights
         Weights the regime implies on each session, before lag and schedule.
     held_weights
-        Weights actually held during each session, after lag and schedule. These
-        are the weights that generated the returns.
+        Lagged overlay weights used to calculate each session's return, not
+        physical position units or proof of an executable trade.
     gross_returns
         Portfolio return before transaction costs.
     net_returns
@@ -325,6 +324,44 @@ def _adopted_schedule(targets: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(adopted_rows, index=targets.index, columns=targets.columns)
 
 
+def _raise_invalid_prices(bad: pd.DataFrame) -> None:
+    if bad.any(axis=None):
+        rows, columns = np.nonzero(bad.to_numpy(dtype=bool))
+        session = pd.Timestamp(bad.index[rows[0]]).date()
+        symbol = bad.columns[columns[0]]
+        raise ValueError(f"invalid close/return prices for {symbol!r} on {session}")
+
+
+def _finite_mask(frame: pd.DataFrame) -> pd.DataFrame:
+    values = frame.to_numpy(dtype="float64", na_value=np.nan)
+    return pd.DataFrame(np.isfinite(values), index=frame.index, columns=frame.columns)
+
+
+def _checked_returns(
+    prices: pd.DataFrame,
+    required: pd.DataFrame,
+    *,
+    allow_initial_missing: bool = False,
+) -> pd.DataFrame:
+    """Validate both marks of every used close-to-close return, without fills."""
+    if not all(is_numeric_dtype(dtype) for dtype in prices.dtypes):
+        raise ValueError("close prices must be numeric")
+    current = prices.reindex(index=required.index, columns=required.columns)
+    previous = prices.shift(1).reindex(index=required.index, columns=required.columns)
+    needs_previous = required.copy()
+    if allow_initial_missing and prices.index[0] in required.index:
+        needs_previous.loc[[prices.index[0]], :] = False
+    current_valid = (_finite_mask(current) & current.gt(0.0)).fillna(False)
+    previous_valid = (_finite_mask(previous) & previous.gt(0.0)).fillna(False)
+    _raise_invalid_prices((required & ~current_valid) | (needs_previous & ~previous_valid))
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        returns = prices.pct_change(fill_method=None).reindex(
+            index=required.index, columns=required.columns
+        )
+    _raise_invalid_prices(needs_previous & ~_finite_mask(returns))
+    return returns
+
+
 def simulate_weights(
     prices: pd.DataFrame,
     target_weights: pd.DataFrame,
@@ -343,7 +380,9 @@ def simulate_weights(
     Parameters
     ----------
     prices
-        Closing prices, dates by symbols. Must include the benchmark.
+        Numeric closing prices, dates by symbols. Must include the benchmark.
+        Required current/previous marks must be finite and positive. Prices
+        are never implicitly filled; unused missing assets are tolerated.
     target_weights
         Decision frame: one row per decision date, one column per risk asset
         plus an optional :data:`CASH_COLUMN`. Columns must be a subset of
@@ -372,7 +411,9 @@ def simulate_weights(
     ------
     ValueError
         On any invalid input described above, or when fewer than two sessions
-        survive alignment.
+        survive alignment. Undefined exposed or benchmark returns are errors;
+        only the benchmark's first interval may lack a preceding observation
+        when evaluation begins at the first input row.
     """
     backtest_cfg = settings.backtest
     benchmark = settings.data.benchmark
@@ -394,8 +435,6 @@ def simulate_weights(
         raise ValueError(msg)
 
     aligned = aligned.loc[usable]
-    asset_returns = prices.loc[:, investable].pct_change().loc[usable]
-
     # Event-driven rebalancing: adopt a new target only when it departs from
     # the last adopted one by more than the trade threshold.
     scheduled = _adopted_schedule(aligned)
@@ -414,6 +453,11 @@ def simulate_weights(
         cash_idx = cast(int, held.columns.get_loc(CASH_COLUMN))
         held.iloc[:lead_in, cash_idx] = 1.0
 
+    asset_returns = _checked_returns(prices.loc[:, investable], held.loc[:, investable].gt(0.0))
+    benchmark_required = pd.DataFrame(True, index=usable, columns=[benchmark])
+    benchmark_returns = _checked_returns(
+        prices.loc[:, [benchmark]], benchmark_required, allow_initial_missing=True
+    )[benchmark].rename("benchmark_return")
     daily_rf = backtest_cfg.risk_free_rate / settings.features.trading_days_per_year
     risk_returns = (held.loc[:, investable] * asset_returns).sum(axis="columns")
     cash_returns = held[CASH_COLUMN] * daily_rf
@@ -430,8 +474,6 @@ def simulate_weights(
 
     costs = (traded * backtest_cfg.transaction_cost_bps / 1e4).rename("cost")
     net_returns = (gross_returns - costs).rename("net_return")
-
-    benchmark_returns = prices[benchmark].pct_change().loc[usable].rename("benchmark_return")
 
     metrics = compute_metrics(
         net_returns,

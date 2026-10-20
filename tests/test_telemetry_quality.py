@@ -39,6 +39,33 @@ from regimelab.settings import Settings
 _GAP_SESSIONS = 8
 
 
+@pytest.mark.parametrize("asof", [dt.date(2024, 1, 6), dt.date(2024, 1, 8)])
+def test_absent_weekend_or_weekday_is_not_inferred_to_be_a_market_closure(asof: dt.date) -> None:
+    """The same supplied Friday cannot prove why a later date is absent."""
+    calendar = pd.DatetimeIndex(["2024-01-05"])
+    frame = pd.DataFrame(
+        {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [1000.0]},
+        index=calendar,
+    )
+    panel = align_panel(panel_from_symbol_frames({"SPY": frame}), anchor="SPY")
+    warnings = pipeline._data_quality_warnings(
+        asof=asof,
+        session_date=dt.date(2024, 1, 5),
+        observation_date=dt.date(2024, 1, 5),
+        features=pd.DataFrame({"trailing_return": [0.01]}, index=calendar),
+        feature_names=("trailing_return",),
+        panel=panel,
+    )
+    assert warnings == (
+        (
+            f"asof_not_in_panel: requested asof {asof} is not present in the provided panel; "
+            "last available session 2024-01-05; verify an exchange calendar to distinguish "
+            "market closure from unavailable data"
+        ),
+    )
+    assert "is not a trading session" not in warnings[0]
+
+
 @pytest.fixture(scope="module")
 def raw_panel(test_settings: Settings) -> pd.DataFrame:
     """The raw provider panel, fetched the same way ``_fetch_and_align`` does."""
@@ -95,7 +122,7 @@ def test_session_and_observation_date_validators() -> None:
     with pytest.raises(pydantic.ValidationError, match="is after asof"):
         _payload(asof=asof, session_date=dt.date(2020, 1, 11), observation_date=session)
 
-    # A non-session asof is not stale by itself: only data lag counts.
+    # This property compares two supplied dates, not the expected exchange date.
     assert _payload(asof=asof, session_date=session, observation_date=session).is_stale is False
     assert (
         _payload(asof=asof, session_date=session, observation_date=dt.date(2020, 1, 8)).is_stale
@@ -144,11 +171,11 @@ def test_gap_produces_stale_observation_warnings(
     )
 
 
-def test_non_session_asof_reports_session_date(
+def test_asof_not_in_panel_reports_session_date(
     test_settings: Settings,
     raw_panel: pd.DataFrame,
 ) -> None:
-    """A Saturday as-of resolves to Friday's session and says so."""
+    """An absent as-of reports the last supplied session without inferring why."""
     aligned = align_panel(raw_panel, anchor=test_settings.data.benchmark)
     calendar = aligned.calendar
 
@@ -165,18 +192,19 @@ def test_non_session_asof_reports_session_date(
     assert payload.is_stale is False
     assert payload.warnings == (
         (
-            "non_session_asof: requested asof 2020-12-26 is not a trading "
-            "session; last session 2020-12-25"
+            "asof_not_in_panel: requested asof 2020-12-26 is not present in the provided panel; "
+            "last available session 2020-12-25; verify an exchange calendar to distinguish "
+            "market closure from unavailable data"
         ),
     )
 
 
-def test_non_session_asof_with_gap(
+def test_asof_not_in_panel_with_gap(
     test_settings: Settings,
     raw_panel: pd.DataFrame,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-session as-of plus a data gap produces both warnings, in order."""
+    """An absent as-of plus a data gap produces both warnings, in order."""
     vix3m = test_settings.data.vix3m_symbol
     session = pd.Timestamp("2020-12-25")
 
@@ -211,8 +239,9 @@ def test_non_session_asof_with_gap(
 
     assert payload.warnings == (
         (
-            "non_session_asof: requested asof 2020-12-26 is not a trading "
-            "session; last session 2020-12-25"
+            "asof_not_in_panel: requested asof 2020-12-26 is not present in the provided panel; "
+            "last available session 2020-12-25; verify an exchange calendar to distinguish "
+            "market closure from unavailable data"
         ),
         (
             "stale_observation: regime computed on "

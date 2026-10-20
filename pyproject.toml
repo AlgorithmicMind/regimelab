@@ -1,6 +1,6 @@
 [project]
 name = "regimelab"
-version = "0.3.0"
+version = "0.4.0"
 description = "Institutional market-regime detection engine: HMM/Hamilton regime switching, PCA absorption ratio, VIX term structure, point-in-time backtesting and automated reporting."
 readme = "README.md"
 license = "MIT"
@@ -69,7 +69,7 @@ build-backend = "hatchling.build"
 packages = ["src/regimelab"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/regimelab", "tests", "README.md", "LICENSE"]
+include = ["src/regimelab", "tests", "docs", "README.md", "CHANGELOG.md", "uv.lock", "LICENSE"]
 
 [tool.ruff]
 line-length = 100

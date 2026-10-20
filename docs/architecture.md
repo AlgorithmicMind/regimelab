@@ -90,9 +90,9 @@ All sections are immutable (`frozen=True`) and ignore unmapped foreign environme
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `signal_lag_days` | `int` | `1` | Days between observing a regime and trading it. `>= 1`. |
+| `signal_lag_days` | `int` | `1` | Legacy target-vector session shift, not a fill timestamp; next-open API requires 1. |
 | `refit_frequency_days` | `int` | `21` | Walk-forward refit frequency. `>= 1`. |
-| `transaction_cost_bps` | `float` | `5.0` | Transaction cost in bp per unit of turnover. `>= 0`. |
+| `transaction_cost_bps` | `float` | `5.0` | Engine-specific cost per traded notional; legacy includes CASH changes, next-open counts risky fills only. |
 | `initial_capital` | `float` | `1_000_000.0` | Initial capital. `> 0`. |
 | `risk_free_rate` | `float` | `0.02` | Annual risk-free rate. `>= 0`. |
 | `regime_weights` | `dict[MarketRegime, dict[str, float]]` | Regime table (see defaults) | Target weights per regime. |
@@ -387,12 +387,39 @@ Also includes diagnostic columns: `parkinson_vol`, `defensive_correlation`.
 #### 2.7.2 `regimelab.backtest.metrics`
 
 - `equity_curve(returns, initial=1.0) -> pd.Series`
-- `drawdown_series(equity) -> pd.Series`
+- `drawdown_series(equity, *, initial=None) -> pd.Series`
 - `PerformanceMetrics` (Pydantic):
   - Fields: `n_observations`, `start`, `end`, `total_return`, `cagr`, `annual_volatility`, `sharpe`, `sortino`, `max_drawdown`, `calmar`, `hit_rate`, `skewness`, `excess_kurtosis`, `var_95`, `cvar_95`, `average_exposure`, `annual_turnover`, `total_cost`
   - Method: `summary_rows() -> list[tuple[str, str]]`
-- `compute_metrics(returns, *, trading_days=252, risk_free_rate=0.0, weights=None, turnover=None, costs=None) -> PerformanceMetrics`
+- `compute_metrics(returns, *, trading_days=252, risk_free_rate=0.0, weights=None, turnover=None, costs=None, initial_equity=None) -> PerformanceMetrics`
 - `regime_conditional_metrics(returns, regimes, *, trading_days=252, order=None) -> pd.DataFrame`
+
+The optional initial-equity arguments include starting capital in the running
+drawdown peak. Their default `None` preserves legacy metric values.
+
+**Opt-in next-open ledger (0.4.0)**
+
+`regimelab.backtest.portfolio` exports `simulate_next_open` and `NextOpenResult`
+through `regimelab.backtest`. It does not replace `simulate_weights`,
+`run_backtest`, the walk-forward pipeline or the CLI's default execution path.
+The public API accepts closes, targets and settings plus opening prices and
+an explicit timezone-aware exchange schedule. Publication timestamps and
+opening/closing observation masks are optional explicit inputs.
+
+The private input layer validates the calendar/weights/provenance and selects
+only instructions available strictly before each opening. One private ledger
+values prior positions overnight, performs self-financing opening trades,
+then marks unchanged units at the close. The benchmark uses that same ledger.
+Targets are not silently rebalanced daily; opening/closing weights are distinct.
+Fees apply to actual risky fill notionals, not the residual cash transfer.
+Cash from the previous close earns the specified session rate before the open.
+Initial equity 1.0 is included when computing the new ledger's drawdowns.
+
+`NextOpenResult.to_frame()` exposes units, signed fills, cash/interest, costs,
+NAV before/after trading, eligible decision dates and scheduled openings.
+Scheduled timestamps are not proof of a nonzero fill. See
+[the execution specification](next_open_execution.md) for the exact contract,
+validation boundaries and synthetic acceptance cases.
 
 #### 2.7.3 `regimelab.backtest.walkforward`
 
@@ -491,15 +518,16 @@ TelemetryPayload(
 ```
 
 - `asof`: decision date.
-- `session_date`: last master-calendar session at or before `asof`; strictly earlier means the request fell on a non-trading day.
+- `session_date`: last master-calendar session supplied at or before `asof`; an earlier date can mean market closure or unavailable input data and is not classified without an exchange calendar.
 - `observation_date`: date of the last complete feature row used for the posterior; `is_stale` is `observation_date < session_date` — data lag, not a calendar gap.
+- A false `is_stale` flag does not prove that the panel contains the expected exchange session; consumers must compare coverage with their market calendar.
 - `regime`: modal regime.
 - `probabilities`: full posterior distribution (dict `MarketRegime -> float`).
 - `features`: causal systemic-risk snapshot.
 - `model`: fit metadata (name, seed, training range, etc.).
 - `state_statistics`: per-regime statistics of the *training window* of the model signing the payload (`model.train_start..train_end`), in ladder order; `statistics_for(regime)` looks one up (`KeyError` when uncovered). Duplicate regimes are rejected by validation.
 - `target_weights`: current-regime target weights, or `None` if no backtest is configured.
-- `warnings`: data-quality degradations reported by the pipeline, in order: `non_session_asof`, `stale_observation`, `missing_feature`, `stale_input`, `dropped_symbol`. The payload describes the gap but never fills it; whether to publish is the consumer's decision.
+- `warnings`: data-quality degradations reported by the pipeline, in order: `asof_not_in_panel`, `stale_observation`, `missing_feature`, `stale_input`, `dropped_symbol`. The payload describes the gap but never fills it; whether to publish is the consumer's decision.
 
 **Validators**
 
@@ -764,11 +792,11 @@ Parametrized for three dates: `2020-03-16`, `2020-06-15`, `2020-12-31`. Counts a
 ### 4.12 `tests/test_telemetry_quality.py`
 
 - `TelemetryPayload` validators enforce `observation_date <= session_date <= asof`; `is_stale` compares the observation to the session, not the calendar.
-- Data gaps produce, in order, `non_session_asof`, `stale_observation`, `missing_feature`, `stale_input`, `dropped_symbol` warnings; clean sessions produce none.
+- Data gaps produce, in order, `asof_not_in_panel`, `stale_observation`, `missing_feature`, `stale_input`, `dropped_symbol` warnings; clean sessions produce none.
 - `state_statistics` rejects duplicate regimes; `statistics_for(regime)` resolves by regime (`KeyError` when uncovered); payloads from `run_single_asof` and `latest_telemetry` carry the owning fold's statistics.
 - A duplicate-regime mapping (guardrail) still produces a valid payload; a `gmm` (VOLATILITY) pipeline run carries unique, ladder-ordered statistics.
 
-**Total: 89 collected test cases** (the parametrized as-of fixture counts as 3).
+The release gate records the collected test count. Additional coverage exercises the next-open ledger, publication/price provenance, initial-equity metrics and selected-restart convergence metadata.
 
 ---
 

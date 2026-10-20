@@ -108,7 +108,7 @@ class HiddenMarkovRegimeModel(RegimeModel):
 
         best_model: object | None = None
         best_score = -np.inf
-        converged_any = False
+        best_converged = False
 
         for restart in range(self._settings.n_init):
             # Deterministic per-restart seed derived from the master seed.
@@ -144,11 +144,11 @@ class HiddenMarkovRegimeModel(RegimeModel):
                 continue
 
             monitor_converged = bool(getattr(model.monitor_, "converged", False))
-            converged_any = converged_any or monitor_converged
 
             if score > best_score:
                 best_score = score
                 best_model = model
+                best_converged = monitor_converged
 
         if best_model is None:
             msg = (
@@ -157,7 +157,7 @@ class HiddenMarkovRegimeModel(RegimeModel):
             )
             raise InsufficientDataError(msg)
 
-        return self._estimate_from_model(best_model, matrix, converged_any)
+        return self._estimate_from_model(best_model, matrix, best_converged)
 
     def _estimate_from_model(
         self,
