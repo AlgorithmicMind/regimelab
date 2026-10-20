@@ -39,36 +39,6 @@ Most open-source regime detection scripts fit a Hidden Markov Model (HMM) on the
 
 ---
 
-## 🆕 What's new in 0.4.0
-
-- `simulate_next_open` / `NextOpenResult`: an opt-in position ledger with opening fills, actual unit drift, self-financing costs, observation masks and publication ordering.
-- The legacy overlay keeps valid-input outputs but now rejects unavailable prices needed for a held return or benchmark.
-- Warning migration: replace consumers of `non_session_asof` with `asof_not_in_panel`. This means absent panel coverage, not a confirmed market closure. Check an exchange calendar for publication eligibility; `is_stale=False` alone does not establish freshness.
-- Selected-restart HMM convergence metadata and opt-in initial-equity drawdowns are corrected without changing legacy metric defaults.
-
-See [the execution contract](docs/next_open_execution.md) and [CHANGELOG](CHANGELOG.md) for conventions and compatibility.
-
-## 🆕 What's new in 0.3.0
-
-- **Typed regime statistics**: `LabelAssignment.to_statistics()` returns `RegimeStatistics` per regime; `TelemetryPayload.state_statistics` and each `WalkForwardFold` carry them (`statistics_for(regime)` looks one up).
-- **`simulate_weights`**: the execution engine behind `run_backtest` is now public — backtest any hand-built weight schedule under the same signal-lag, rebalancing and cost assumptions.
-- **Leading low-confidence sessions sit in cash**: sessions before the first confident decision now earn the risk-free rate instead of a hard zero.
-- **Single data path**: the pipeline fetches through `load_aligned_panel` — cache in `data.cache_dir` within `data.cache_ttl_hours`, anchored on `data.calendar_anchor`; `force_refresh=True` bypasses the cache.
-- **Breaking for type consumers**: `BacktestResult.regimes` and `regime_metrics` are now optional (`None` when no regime path was supplied).
-
-See the [CHANGELOG](CHANGELOG.md) for the full list.
-
-## 🆕 What's new in 0.2.0
-
-- **Causal walk-forward**: each fold labels only its own interval `(r_k, r_{k+1}]` with a model trained through `r_k` — no look-ahead, no overlapping labels.
-- **Stress labelling**: `RankingMethod.STRESS` (default for HMM/Hamilton) orders states by signed emission means; the positive-drift guardrail no longer applies.
-- **Official volatility sources**: `^VIX`/`^VIX3M` read from CBOE, then FRED, with the configured provider as fallback (`volatility_source`).
-- **Data-quality telemetry**: `TelemetryPayload` reports `session_date`, `observation_date`, `is_stale` and explicit `warnings` for stale or missing inputs.
-- **Signal vs. investable universes**: `DataSettings.correlation_assets` decouples the correlation features from `risk_assets`, which now only drives the backtest.
-- **Live signal = backtest signal**: `run_single_asof` defaults to `refit_policy="walkforward"`, reproducing the walk-forward posterior for the requested date.
-
-See the [CHANGELOG](CHANGELOG.md) for the full list.
-
 ## 🚀 Quickstart
 
 ### 1. Installation
@@ -109,6 +79,16 @@ print(f"Stale: {payload.is_stale}")
 for warning in payload.warnings:
     print(f"  warning: {warning}")
 ```
+
+`asof_not_in_panel` means absent panel coverage, not a confirmed market
+closure. Check an exchange calendar before publication; `is_stale=False`
+alone does not establish freshness.
+
+#### Regime Statistics
+
+`RegimeStatistics` entries are available through
+`TelemetryPayload.state_statistics` and `WalkForwardFold.statistics`. Use
+`payload.statistics_for(regime)` to look up one regime's statistics.
 
 #### Extract Causal Systemic Risk Features
 
@@ -162,16 +142,16 @@ result = simulate_weights(prices, targets, settings)
 print(f"60/40 Sharpe: {result.metrics.sharpe:.2f}")
 ```
 
-This is the legacy close-only overlay: it retains its integer-lag,
-constant-weight and cash-inclusive-turnover conventions. It is not an opening
-fill simulator. Its numerical outputs for valid inputs remain unchanged for
-compatibility.
+This is the legacy close-only overlay: it uses integer-lag,
+constant-weight and cash-inclusive-turnover conventions. It is not an
+opening fill simulator. Missing, nonfinite or nonpositive prices needed
+for an exposed return or the benchmark raise `ValueError`.
 
-#### Next-open position ledger (0.4.0)
+#### Next-open position ledger
 
 `simulate_next_open` retains actual adjusted units between instructions, pays
 costs on risky buys/sells (not cash transfers), and requires a caller-supplied
-exchange schedule. It is included in 0.4.0, not in 0.3.0.
+exchange schedule.
 
 This fully offline example buys at 103 after the previous close of 100. It
 earns only the subsequent move from 103 to 104, not the overnight gap:
@@ -298,6 +278,10 @@ confidence_floor = 0.5
 refit_frequency_days = 63
 ```
 
+- **Signal and investable universes:** `data.correlation_assets` defines correlation inputs independently of investable `data.risk_assets`.
+- **Volatility sources:** `data.volatility_source` configures CBOE/FRED sourcing for `^VIX` and `^VIX3M`, with provider fallback.
+- **Panel caching:** `load_aligned_panel` uses `data.cache_dir` and `data.cache_ttl_hours`, anchored on `data.calendar_anchor`; `force_refresh=True` bypasses the cache.
+
 ---
 
 ## 🧪 Testing & Formal Verification
@@ -314,6 +298,15 @@ uv run mypy src/regimelab
 # Lint with ruff
 uv run ruff check .
 ```
+
+---
+
+## Documentation
+
+- [Architecture and methodology](docs/architecture.md)
+- [Next-open execution contract](docs/next_open_execution.md)
+- [Changelog and migration notes](CHANGELOG.md)
+- [Release notes and downloads](https://github.com/AlgorithmicMind/regimelab/releases)
 
 ---
 
