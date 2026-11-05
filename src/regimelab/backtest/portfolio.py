@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,7 @@ class NextOpenResult(Ledger):
     benchmark_returns: pd.Series
     benchmark_equity: pd.Series
     benchmark_metrics: PerformanceMetrics
+    rebalance_policy: Literal["target_change", "each_instruction"] = "target_change"
 
     @property
     def drawdown(self) -> pd.Series:
@@ -99,6 +100,11 @@ class _Summary:
     metrics: PerformanceMetrics
 
 
+def _validate_rebalance_policy(value: object) -> None:
+    if not isinstance(value, str) or value not in ("target_change", "each_instruction"):
+        raise ValueError("rebalance_policy must be 'target_change' or 'each_instruction'")
+
+
 def _summarize(ledger: Ledger, settings: Settings) -> _Summary:
     capital = settings.backtest.initial_capital
     previous = ledger.nav.shift(1, fill_value=capital)
@@ -136,6 +142,7 @@ def simulate_next_open(
     open_observed: pd.DataFrame | None = None,
     close_observed: pd.DataFrame | None = None,
     start: dt.date | None = None,
+    rebalance_policy: Literal["target_change", "each_instruction"] = "target_change",
 ) -> NextOpenResult:
     """Execute close-of-session targets at an eligible later regular opening.
 
@@ -146,7 +153,7 @@ def simulate_next_open(
         Missing prices are not filled. Fractional adjusted units are allowed.
     target_weights
         Sparse, long-only close-of-session decisions; cash is the residual.
-        Identical targets retain units, not constant portfolio weights.
+        By default identical targets retain units, not constant weights.
     settings
         Universe, benchmark, initial capital, cash APR and all-in per-risky-leg
         transaction cost in bps. This convention excludes cash from turnover.
@@ -166,6 +173,12 @@ def simulate_next_open(
     start
         Portfolio inception on/after this date. Otherwise the first session
         after the earliest decision (or first price session for no decisions).
+    rebalance_policy
+        ``target_change`` preserves the original target-adoption convention.
+        ``each_instruction`` restores exposure at each newly eligible decision,
+        even for an identical vector. Carried decisions are not new requests.
+        Already-matching exposure creates no fills or fees within the existing
+        numerical weight tolerance. The benchmark always remains buy-and-hold.
 
     Returns
     -------
@@ -178,8 +191,9 @@ def simulate_next_open(
     ------
     ValueError
         On ambiguous input ordering, unavailable used prices, invalid weights,
-        costs or schedules, or an unfinanceable/nonfinite portfolio.
+        costs, schedules or rebalance policy, or an unfinanceable/nonfinite portfolio.
     """
+    _validate_rebalance_policy(rebalance_policy)
     inputs = prepare_inputs(
         prices,
         target_weights,
@@ -192,6 +206,10 @@ def simulate_next_open(
         start=start,
     )
     assets = list(inputs.assets)
+    requests = None
+    if rebalance_policy == "each_instruction":
+        owners = inputs.decision_at_open
+        requests = owners.notna() & owners.ne(owners.shift(1))
     ledger = run_ledger(
         inputs.opens.loc[:, assets],
         inputs.closes.loc[:, assets],
@@ -201,6 +219,7 @@ def simulate_next_open(
         daily_rf=inputs.daily_rf,
         open_observed=inputs.open_observed.loc[:, assets],
         close_observed=inputs.close_observed.loc[:, assets],
+        rebalance_requests=requests,
     )
     benchmark = settings.data.benchmark
     benchmark_targets = pd.DataFrame({benchmark: 1.0, CASH_COLUMN: 0.0}, index=inputs.opens.index)
@@ -239,4 +258,5 @@ def simulate_next_open(
         benchmark_returns=comparison.returns.rename("benchmark_return"),
         benchmark_equity=comparison.equity.rename("benchmark_equity"),
         benchmark_metrics=comparison.metrics,
+        rebalance_policy=rebalance_policy,
     )

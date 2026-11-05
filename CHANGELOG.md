@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0 - 2026-11-05
+
+- Added an opt-in `rebalance_policy="each_instruction"` for newly eligible explicit decisions, reusing the existing next-open ledger and self-financing costs; carried decisions do not trigger restoration.
+- The default `target_change` policy, benchmark buy-and-hold convention and existing numeric `to_frame()` schema remain unchanged; the result records its resolved policy.
+- Prepared for manual publication. No Aegis installation or production migration is part of this release preparation.
+
 ## 0.4.0 — 2026-10-20
 
 - Fix: HMM convergence metadata describes the selected highest-likelihood restart, not whether any restart converged. Model selection and fitted numerical parameters are unchanged.

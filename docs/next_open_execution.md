@@ -1,8 +1,10 @@
 # Next-open execution: implementation specification
 
-Status: **Implemented on the local development branch; not released or
-integrated into Aegis.** The selected-HMM-restart metadata fix is independent
-of this API.
+Status: **Baseline ledger: 0.4.0. The `rebalance_policy` extension is prepared
+as a 0.5.0 release candidate; not published or installed in Aegis.** The
+selected-HMM-restart metadata fix is independent of this API. Publication is
+a separate manual maintainer action. No allocation selection, registered
+experiment rerun or production migration is authorized.
 
 This specification introduces an explicit, opt-in position ledger. It does not
 change the existing `simulate_weights` / `run_backtest` numeric convention,
@@ -26,6 +28,7 @@ def simulate_next_open(
     open_observed: pd.DataFrame | None = None,
     close_observed: pd.DataFrame | None = None,
     start: dt.date | None = None,
+    rebalance_policy: Literal["target_change", "each_instruction"] = "target_change",
 ) -> NextOpenResult:
     ...
 ```
@@ -139,10 +142,32 @@ cash minus signed risky purchases and fees, not as a leveraged borrowing.
 Reconcile post-trade NAV, fees, units and cash; tolerate only floating-point
 residue, never a real negative cash balance or nonfinite/invalid NAV.
 
-Adopt a new target only if it differs from the last adopted target by more
-than the existing 1e-9 weight threshold. Compare targets, not actual drifted
-weights. Repeated identical instructions do not authorize daily rebalancing.
-Keep units unchanged between adoption events, even when weights drift.
+With `rebalance_policy="target_change"` (the unchanged default), adopt a new
+target only if it differs from the last adopted target by more than the
+existing 1e-9 weight threshold. Compare targets, not actual drifted weights.
+Repeated identical instructions do not authorize daily rebalancing. Keep units
+unchanged between adoption events, even when weights drift.
+
+With `rebalance_policy="each_instruction"`, each newly eligible observation
+date requests restoration of its target, even when the vector is unchanged.
+Identify a new request from a change in `decision_at_open`, not from an
+additional forward-carried row. The first eligible decision at inception is
+new, including a decision observed before the explicit start.
+
+On a request, compare the target with actual opening weights after cash
+interest and before fees, using the same existing 1e-9 numerical threshold.
+If they already match, preserve units and charge no fee; this also applies
+when a different target vector happens to match drifted exposure. Otherwise
+use the identical self-financing equation, solver, fills and valuation ledger
+described above. There is no second constant-weight return engine, artificial
+daily cash reset or new economic rebalancing band.
+
+Both modes retain all publication, observation-mask and missing-price rules.
+In particular, this SDK can admit an instruction at a later opening after a
+late publication; a caller requiring one original intended opening (such as
+Aegis) must reject a missed opening before supplying that instruction. This
+extension does not change or bypass the caller's stricter eligibility gates.
+An end-of-window decision without a later supplied opening remains unfilled.
 
 ## 5. Result and benchmark
 
@@ -163,6 +188,8 @@ Keep units unchanged between adoption events, even when weights drift.
 - `traded_notional`: gross risky fill notional divided by pre-trade opening
   NAV. This is gross traded exposure, not half-turnover.
 - `metrics`, `benchmark_returns`, `benchmark_equity`, `benchmark_metrics`.
+- `rebalance_policy`: the resolved policy string; the added attribute does not
+  change the existing numeric columns or schema returned by `to_frame()`.
 
 Calculate metrics from the net ledger using existing metric helpers. For
 exposure reporting use actual opening weights and disclose that convention.
@@ -183,6 +210,12 @@ then holds units without daily rebalancing. It uses the same ledger, not a
 separate accounting implementation. Benchmark and strategy share inception
 and evaluated sessions. Static allocation comparators must also use this
 ledger; full-period mean weights remain an ex-post diagnostic.
+
+Selecting `each_instruction` for a strategy never changes this buy-once
+benchmark convention. A daily-rebalanced static comparator requires an
+explicit decision for each eligible opening and `each_instruction`; merely
+repeating the vector under `target_change` is not equivalent. The capability
+does not itself validate any strategy, source availability or allocation.
 
 ## 6. Acceptance and validation
 

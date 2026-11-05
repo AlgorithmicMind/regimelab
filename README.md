@@ -149,9 +149,9 @@ for an exposed return or the benchmark raise `ValueError`.
 
 #### Next-open position ledger
 
-`simulate_next_open` retains actual adjusted units between instructions, pays
-costs on risky buys/sells (not cash transfers), and requires a caller-supplied
-exchange schedule.
+By default, `simulate_next_open` retains actual adjusted units between
+instructions, pays costs on risky buys/sells (not cash transfers), and requires
+a caller-supplied exchange schedule.
 
 This fully offline example buys at 103 after the previous close of 100. It
 earns only the subsequent move from 103 to 104, not the overnight gap:
@@ -181,6 +181,15 @@ result = simulate_next_open(
 print(result.net_returns.iloc[0])  # 1 / 103, approximately 0.00970874
 print(result.to_frame())          # units, cash, fees, timing and opening/closing weights
 ```
+
+The 0.5.0 release candidate adds `rebalance_policy="each_instruction"`, which
+requests restoration at each newly eligible decision, including an identical
+vector. A forward-carried decision is not a new request; already-matching
+exposure generates no fills or fees. `target_change` remains the default and
+the benchmark remains buy-and-hold. `result.rebalance_policy` records the
+resolved choice; the existing `to_frame()` columns are unchanged. This keyword
+is not part of the published 0.4.0 package. Publication of 0.5.0 remains a
+manual maintainer action; see the execution specification for its contract.
 
 Without `published_at`, availability at the decision close is an explicit
 research assumption. Supply actual timezone-aware publication timestamps for

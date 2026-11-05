@@ -17,7 +17,7 @@ from regimelab.backtest import NextOpenResult, simulate_next_open, simulate_weig
 from regimelab.settings import BacktestSettings, DataSettings, Settings
 
 
-def main() -> None:
+def main() -> None:  # noqa: PLR0915
     """Verify installed identity, both execution APIs and core CLI entry points."""
     prefix = Path(sys.prefix).resolve()
     site = Path(sysconfig.get_path("purelib")).resolve()
@@ -26,8 +26,8 @@ def main() -> None:
     configuration = (prefix / "pyvenv.cfg").read_text(encoding="utf-8").lower()
     assert "include-system-site-packages = false" in configuration
     assert module_path.is_relative_to(site), (module_path, site)
-    assert regimelab.__version__ == "0.4.0"
-    assert importlib.metadata.version("regimelab") == "0.4.0"
+    assert regimelab.__version__ == "0.5.0"
+    assert importlib.metadata.version("regimelab") == "0.5.0"
     distribution = importlib.metadata.distribution("regimelab")
     direct_url = distribution.read_text("direct_url.json")
     if direct_url:
@@ -62,6 +62,45 @@ def main() -> None:
     gap_return = float(result.net_returns.iloc[0])
     assert abs(gap_return - 1 / 103) <= 1e-12
     assert result.to_frame()["has_fills"].tolist() == [True, False]
+    assert result.rebalance_policy == "target_change"
+
+    mixed_closes = pd.DataFrame(
+        {"SPY": [100.0, 120.0, 132.0], "GLD": [100.0, 100.0, 90.0]}, index=dates
+    )
+    mixed_opens = pd.DataFrame(
+        {"SPY": [100.0, 100.0, 120.0], "GLD": [100.0, 100.0, 100.0]}, index=dates
+    )
+    mixed_targets = pd.DataFrame({"SPY": 0.5, "GLD": 0.5}, index=dates[:2])
+    mixed_settings = settings.model_copy(
+        update={"backtest": settings.backtest.model_copy(update={"initial_capital": 200.0})}
+    )
+    default = simulate_next_open(
+        mixed_closes, mixed_targets, mixed_settings, open_prices=mixed_opens, sessions=sessions
+    )
+    explicit = simulate_next_open(
+        mixed_closes,
+        mixed_targets,
+        mixed_settings,
+        open_prices=mixed_opens,
+        sessions=sessions,
+        rebalance_policy="each_instruction",
+    )
+    carried = simulate_next_open(
+        mixed_closes,
+        mixed_targets.iloc[:1],
+        mixed_settings,
+        open_prices=mixed_opens,
+        sessions=sessions,
+        rebalance_policy="each_instruction",
+    )
+    assert explicit.rebalance_policy == "each_instruction"
+    assert abs(float(default.nav.iloc[-1]) - 222.0) <= 1e-10
+    assert abs(float(explicit.nav.iloc[-1]) - 220.0) <= 1e-10
+    assert abs(float(carried.nav.iloc[-1]) - 222.0) <= 1e-10
+    assert abs(float(explicit.traded_values["SPY"].iloc[-1]) + 10.0) <= 1e-10
+    assert abs(float(explicit.traded_values["GLD"].iloc[-1]) - 10.0) <= 1e-10
+    pd.testing.assert_series_equal(default.benchmark_returns, explicit.benchmark_returns)
+
     legacy_prices = prices.copy()
     legacy_prices.loc[dates[-1], "GLD"] = float("nan")
     legacy_targets = pd.DataFrame({"GLD": [1.0]}, index=dates[:1])
@@ -99,6 +138,9 @@ def main() -> None:
                 "system_site_packages": False,
                 "textual_installed": False,
                 "next_open_gap_return": gap_return,
+                "default_policy_final_nav": float(default.nav.iloc[-1]),
+                "explicit_policy_final_nav": float(explicit.nav.iloc[-1]),
+                "carried_policy_final_nav": float(carried.nav.iloc[-1]),
                 "legacy_gap_error": legacy_error,
                 "module_cli_help": "passed",
                 "console_cli_help": "passed",

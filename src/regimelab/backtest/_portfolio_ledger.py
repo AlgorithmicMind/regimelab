@@ -119,6 +119,25 @@ def _rebalance(
     return new_units, remaining, changes, traded_values, fee
 
 
+def _rebalance_due(  # noqa: PLR0917
+    target: FloatArray,
+    adopted: FloatArray,
+    old_values: FloatArray,
+    cash: float,
+    nav: float,
+    requested: bool | None,
+) -> bool:
+    if not np.isfinite(target).all():
+        return False
+    if requested is None:
+        return bool(np.max(np.abs(target - adopted)) > _TRADE_THRESHOLD)
+    if not requested:
+        return False
+    # An explicit request restores actual opening exposure, not the prior vector.
+    opening_weights = np.append(old_values, cash) / nav
+    return bool(np.max(np.abs(target - opening_weights)) > _TRADE_THRESHOLD)
+
+
 def run_ledger(
     opens: pd.DataFrame,
     closes: pd.DataFrame,
@@ -129,6 +148,7 @@ def run_ledger(
     daily_rf: float,
     open_observed: pd.DataFrame,
     close_observed: pd.DataFrame,
+    rebalance_requests: pd.Series | None = None,
 ) -> Ledger:
     """Apply opening instructions and then mark unchanged units at the close."""
     assets = list(opens.columns)
@@ -137,6 +157,7 @@ def run_ledger(
     px_close = closes.to_numpy(dtype="float64")
     fresh_open = open_observed.to_numpy(dtype=bool)
     fresh_close = close_observed.to_numpy(dtype=bool)
+    requests = None if rebalance_requests is None else rebalance_requests.to_numpy(dtype=bool)
     targets = instructions.loc[:, [*assets, CASH_COLUMN]].to_numpy(dtype="float64")
     position_frames = {
         name: np.zeros((rows, width)) for name in ("positions", "traded_units", "traded_values")
@@ -166,7 +187,14 @@ def run_ledger(
         old_values = _values(units, px_open[row])
         before = _positive_nav(cash + float(old_values.sum()))
         target = targets[row]
-        if np.isfinite(target).all() and np.max(np.abs(target - adopted)) > _TRADE_THRESHOLD:
+        if _rebalance_due(
+            target,
+            adopted,
+            old_values,
+            cash,
+            before,
+            None if requests is None else bool(requests[row]),
+        ):
             required = (units > 0.0) | (target[:-1] > 0.0)
             _require_prices(
                 px_open[row], fresh_open[row], required, assets, session, mark="opening"

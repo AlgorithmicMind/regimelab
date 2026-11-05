@@ -44,6 +44,7 @@ _SOURCE_FILES = (
     "tests/test_telemetry_quality.py",
     "tests/test_next_open_ledger.py",
     "tests/test_next_open_inputs.py",
+    "tests/test_next_open_rebalance_policy.py",
     "tests/_next_open_fixtures.py",
 )
 
@@ -56,7 +57,7 @@ def main() -> None:
     parser.add_argument("--sdist", type=Path, required=True)
     arguments = parser.parse_args()
     source = arguments.source.resolve()
-    version = "0.4.0"
+    version = "0.5.0"
     project = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["project"]["version"] == version
     with zipfile.ZipFile(arguments.wheel) as wheel:
